@@ -33,7 +33,7 @@ Exploits the 3-7 second lag between Binance BTC spot price updates and Polymarke
 1. **Binance tick** (every 100ms): spot price, delta, realized vol
 2. **Strategy eval**: compute implied probability via binary option model
 3. **Edge detection**: compare model prob vs Polymarket contract mid
-4. **Signal generation**: edge > 8% AND contract is stale (>1s behind spot)
+4. **Signal generation**: edge > 3% AND contract is stale (>1s behind spot)
 5. **Risk check**: position limits, drawdown, cooldown, liquidity
 6. **Execution**: place order on Polymarket CLOB
 7. **Monitoring**: track position, exit on edge collapse / timeout / stop loss
@@ -61,14 +61,17 @@ All configuration is in `.env`. Key parameters:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `BANKROLL` | 1300 | Starting capital in USD |
 | `STRIKE_PRICE` | 100000 | BTC price the contract resolves against |
-| `ENTRY_THRESHOLD` | 0.08 | Minimum edge (8%) to enter a trade |
+| `ENTRY_THRESHOLD` | 0.03 | Minimum edge (3%) to enter a trade |
+| `MIN_EDGE` | 0.03 | Absolute minimum edge after cost deduction |
 | `MAX_BET_FRACTION` | 0.04 | Kelly fraction cap (4% of bankroll) |
 | `MAX_POSITION_USD` | 100 | Max USD per single trade |
 | `MAX_OPEN_POSITIONS` | 5 | Concurrent position limit |
 | `COOLDOWN_MS` | 3000 | Minimum ms between trades |
 | `SLIPPAGE_BPS` | 15 | Expected slippage in basis points |
 | `FEE_BPS` | 20 | Polymarket fee in basis points |
+| `ORDER_TYPE` | GTC | Order type (GTC = Good Till Cancelled) |
 
 ## Risk Controls
 
@@ -79,13 +82,15 @@ All configuration is in `.env`. Key parameters:
 - **Cooldown**: 3s minimum between trades
 - **Liquidity Check**: Rejects signals with insufficient book depth
 
-## Finding Contract IDs
+## Contract Discovery
 
-1. Go to [Polymarket](https://polymarket.com)
-2. Find a BTC price contract (e.g., "Will BTC be above $100K on March 1?")
-3. Open browser DevTools → Network tab
-4. Look for CLOB API calls to get `condition_id` and `token_id`
-5. Or use: `curl https://clob.polymarket.com/markets`
+The engine uses `MarketDiscovery` to automatically find and rotate BTC Up/Down 5-minute contracts via the Polymarket Gamma API. Contract IDs are resolved at runtime using a predictable slug format (`btc-updown-5m-{unix_timestamp}` aligned to 300-second boundaries), so no manual lookup is required.
+
+To override with a specific contract, set `POLY_CONDITION_ID`, `POLY_TOKEN_ID_YES`, and `POLY_TOKEN_ID_NO` in `.env`. To browse available markets manually:
+
+```bash
+curl https://clob.polymarket.com/markets
+```
 
 ## Realistic Expectations
 
@@ -107,16 +112,17 @@ Expected realistic performance:
 
 ```
 src/
-├── index.js                 # Main orchestrator
+├── index.js                 # Main orchestrator (ArbEngine)
 ├── config.js                # Config loader + validation
+├── discovery.js             # Auto-discovers BTC Up/Down 5m contracts (Gamma API)
 ├── feeds/
-│   ├── binance.js           # Binance depth WebSocket
+│   ├── binance.js           # Binance depth WebSocket (depth20@100ms)
 │   └── polymarket.js        # Polymarket CLOB WS + REST
 ├── engine/
-│   ├── strategy.js          # Signal generation
-│   └── risk.js              # Risk management
+│   ├── strategy.js          # Signal generation (implied prob, edge calc)
+│   └── risk.js              # Risk management (limits, kill switch)
 ├── execution/
-│   └── executor.js          # Order placement + tracking
+│   └── executor.js          # Order placement + position tracking
 └── utils/
     ├── logger.js            # Structured logging
     ├── math.js              # Probability, Kelly, statistics
