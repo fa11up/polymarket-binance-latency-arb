@@ -5,8 +5,9 @@ import { Strategy } from "./engine/strategy.js";
 import { RiskManager } from "./engine/risk.js";
 import { Executor } from "./execution/executor.js";
 import { MarketDiscovery } from "./discovery.js";
-import { createLogger } from "./utils/logger.js";
+import { createLogger, setLogSink } from "./utils/logger.js";
 import { sendAlert } from "./utils/alerts.js";
+import { TUI } from "./utils/tui.js";
 
 const log = createLogger("MAIN");
 
@@ -16,39 +17,81 @@ const log = createLogger("MAIN");
 
 class ArbEngine {
   constructor() {
-    this.binance = new BinanceFeed();
+    // Build (asset × window) market pairs from config
+    const { assets, windows, symbolMap } = CONFIG.markets;
+    const pairs = [];
+    for (const asset of assets) {
+      for (const win of windows) {
+        const symbol = symbolMap[asset];
+        if (!symbol) { log.warn(`No Binance symbol for asset ${asset} — skipping`); continue; }
+        pairs.push({ asset, windowMins: win, symbol });
+      }
+    }
+
+    // One BinanceFeed per unique symbol (deduplicated)
+    this.binanceFeeds = new Map(); // symbol → BinanceFeed
+    for (const { symbol } of pairs) {
+      if (!this.binanceFeeds.has(symbol)) {
+        this.binanceFeeds.set(symbol, new BinanceFeed(symbol));
+      }
+    }
+
+    // One { discovery, strategy, binance } record per (asset, window) pair
+    this.markets = pairs.map(({ asset, windowMins, symbol }) => ({
+      asset,
+      windowMins,
+      symbol,
+      binance: this.binanceFeeds.get(symbol),
+      strategy: new Strategy(asset, windowMins),
+      discovery: new MarketDiscovery(asset, windowMins),
+      activeMarket: null,
+    }));
+
+    // Shared across all markets
     this.polymarket = new PolymarketFeed();
-    this.strategy = new Strategy();
     this.risk = new RiskManager();
     this.executor = new Executor(this.polymarket, this.risk);
-    this.discovery = new MarketDiscovery();
-    this.activeMarket = null;
+
+    // tokenId → market record (for routing Polymarket book events to the right strategy)
+    this.tokenToMarket = new Map();
+
     this.startTime = Date.now();
     this.statusInterval = null;
+    this.tui = null;
   }
 
   async start() {
-    this._printBanner();
     validateConfig();
+
+    // Launch TUI — routes all log output to the log pane
+    this.tui = new TUI(this.markets.length);
+    setLogSink(line => this.tui.log(line));
 
     log.info("Initializing engine...", {
       dryRun: CONFIG.execution.dryRun,
       bankroll: CONFIG.risk.bankroll,
       threshold: `${(CONFIG.strategy.entryThreshold * 100).toFixed(1)}%`,
-      resolution: "Chainlink BTC/USD CEX",
+      markets: this.markets.map(m => `${m.asset}/${m.windowMins}m`),
+      resolution: "Chainlink CEX",
     });
 
-    // ─── Wire feeds to strategy ─────────────────────────────────────
-    this.binance.on("price", (data) => {
-      this.strategy.onSpotUpdate(data);
-    });
+    // ─── Wire Binance feeds to their strategies ─────────────────────
+    for (const market of this.markets) {
+      market.binance.on("price", (data) => {
+        market.strategy.onSpotUpdate(data);
+      });
+      market.binance.on("error", (err) => {
+        log.error(`[${market.asset}/${market.windowMins}m] Binance feed error`, { error: err.message });
+      });
+    }
 
-    this.binance.on("error", (err) => {
-      log.error("Binance feed error", { error: err.message });
-    });
-
+    // ─── Route Polymarket book events to the correct strategy ───────
+    // Each book event is tagged with `tokenId` (set in _processMessage / polling).
     this.polymarket.on("book", (book) => {
-      this.strategy.onContractUpdate(book);
+      if (book.tokenId) {
+        const m = this.tokenToMarket.get(book.tokenId);
+        if (m) m.strategy.onContractUpdate(book);
+      }
     });
 
     this.polymarket.on("error", (err) => {
@@ -56,79 +99,43 @@ class ArbEngine {
     });
 
     // ─── Wire strategy signals to execution ─────────────────────────
-    this.strategy.onSignal(async (signal) => {
-      // Risk check
-      const check = this.risk.canTrade(signal);
-      if (!check.allowed) {
-        log.debug("Signal rejected by risk manager", { reasons: check.reasons });
-        return;
-      }
-
-      // Execute
-      await this.executor.execute(signal);
-    });
-
-    // ─── Discover active market ─────────────────────────────────────
-    log.info("Discovering active BTC Up/Down 5m market...");
-    this.activeMarket = await this.discovery.findCurrentMarket();
-
-    if (this.activeMarket) {
-      log.info("Active market discovered", {
-        slug: this.activeMarket.slug,
-        endDate: this.activeMarket.endDate,
-        tokenYes: this.activeMarket.tokenIdYes?.slice(0, 10) + "...",
-      });
-
-      // Push discovered tokens to polymarket feed and strategy
-      this.polymarket.tokenIdYes = this.activeMarket.tokenIdYes;
-      this.polymarket.tokenIdNo = this.activeMarket.tokenIdNo;
-      this.strategy.setMarket(this.activeMarket);
-
-      // Start rotation to auto-switch when this market expires
-      this.discovery.startRotation(async (newMarket) => {
-        log.info(`Rotating to new market: ${newMarket.slug}`);
-
-        // Cancel open orders before switching
-        if (this.executor.openOrders.size > 0) {
-          log.warn(`Cancelling ${this.executor.openOrders.size} open orders for market rotation`);
-          await this.executor.cancelAllOrders();
+    for (const market of this.markets) {
+      market.strategy.onSignal(async (signal) => {
+        const check = this.risk.canTrade(signal);
+        if (!check.allowed) {
+          log.debug(`[${signal.label}] Signal rejected`, { reasons: check.reasons });
+          return;
         }
-
-        this.activeMarket = newMarket;
-        this.strategy.setMarket(newMarket);
-        this.polymarket.updateSubscription(newMarket.tokenIdYes, newMarket.tokenIdNo);
-
-        await sendAlert(`🔄 Market rotated: ${newMarket.slug} (ends ${newMarket.endDate})`, "info");
+        await this.executor.execute(signal);
       });
-    } else {
-      log.warn("No active market found — running in monitor-only mode");
     }
+
+    // ─── Discover active markets ─────────────────────────────────────
+    log.info(`Discovering ${this.markets.length} active market(s)...`);
+    await Promise.all(this.markets.map(m => this._initMarket(m)));
 
     // ─── Connect feeds ──────────────────────────────────────────────
-    log.info("Connecting Binance spot feed...");
-    this.binance.connect();
+    log.info("Connecting Binance feeds...");
+    for (const feed of this.binanceFeeds.values()) feed.connect();
 
     log.info("Connecting Polymarket CLOB feed...");
-    if (this.polymarket.tokenIdYes) {
-      // Connect WS for low-latency updates
-      this.polymarket.connectWs();
+    this.polymarket.connectWs();
 
-      // Always start REST polling as baseline — WS can connect but deliver no book data
-      // (Polymarket WS sends deltas only; REST guarantees a fresh snapshot each second)
-      setTimeout(() => {
-        if (!this.polymarket.lastBook) {
-          log.warn("No Polymarket book data received after 5s — starting REST polling");
-        } else {
-          log.info("Polymarket WS delivering book data — starting REST polling as backup");
+    // Always start REST polling as baseline for each market's YES token
+    // (WS can connect but deliver no book data; REST guarantees fresh snapshots)
+    setTimeout(() => {
+      for (const m of this.markets) {
+        if (m.activeMarket?.tokenIdYes) {
+          const hasBook = !!this.polymarket.lastBook;
+          log.info(`[${m.asset}/${m.windowMins}m] Starting REST polling` +
+            (!hasBook ? " (WS silent — primary)" : " (backup)"));
+          this.polymarket.startPolling(m.activeMarket.tokenIdYes, 1000);
         }
-        this.polymarket.startPolling(this.polymarket.tokenIdYes, 1000);
-      }, 5000);
-    } else {
-      log.warn("No Polymarket token ID available — running in monitor-only mode");
-    }
+      }
+    }, 5000);
 
-    // ─── Status dashboard ───────────────────────────────────────────
-    this.statusInterval = setInterval(() => this._printStatus(), 30000);
+    // ─── Status dashboard — redraws TUI every second ─────────────────
+    this.statusInterval = setInterval(() => this._renderDashboard(), 1000);
 
     // ─── Graceful shutdown ──────────────────────────────────────────
     process.on("SIGINT", () => this.shutdown("SIGINT"));
@@ -142,77 +149,124 @@ class ArbEngine {
     });
 
     log.info("Engine running. Waiting for signals...\n");
-    await sendAlert("⚡ Arb engine started" + (CONFIG.execution.dryRun ? " (DRY RUN)" : " (LIVE)"), "info");
+    await sendAlert(
+      `⚡ Arb engine started` +
+      ` (${this.markets.map(m => `${m.asset}/${m.windowMins}m`).join(", ")})` +
+      (CONFIG.execution.dryRun ? " [DRY RUN]" : " [LIVE]"),
+      "info"
+    );
+  }
+
+  /** Discover the current market for one (asset, window) pair and start rotation. */
+  async _initMarket(m) {
+    const label = `${m.asset}/${m.windowMins}m`;
+    m.activeMarket = await m.discovery.findCurrentMarket();
+
+    if (m.activeMarket) {
+      log.info(`[${label}] Active market discovered`, {
+        slug: m.activeMarket.slug,
+        endDate: m.activeMarket.endDate,
+        tokenYes: m.activeMarket.tokenIdYes?.slice(0, 10) + "...",
+      });
+
+      this._registerMarketTokens(m, m.activeMarket);
+      m.strategy.setMarket(m.activeMarket);
+
+      // Subscribe to this market's tokens on Polymarket WS
+      this.polymarket.addSubscription(m.activeMarket.tokenIdYes, m.activeMarket.tokenIdNo);
+
+      // Start rotation timer
+      m.discovery.startRotation(async (newMarket) => {
+        log.info(`[${label}] Rotating to: ${newMarket.slug}`);
+
+        // Cancel open orders for this market
+        const openForMarket = [...this.executor.openOrders.values()]
+          .filter(t => t.signal.label === label);
+        if (openForMarket.length > 0) {
+          log.warn(`[${label}] Cancelling ${openForMarket.length} open orders for rotation`);
+          await this.executor.cancelAllOrders();
+        }
+
+        // Unsubscribe old tokens
+        this.polymarket.removeSubscription(m.activeMarket.tokenIdYes, m.activeMarket.tokenIdNo);
+        this.polymarket.stopPolling(m.activeMarket.tokenIdYes);
+        this._unregisterMarketTokens(m.activeMarket);
+
+        // Register new tokens and update strategy
+        m.activeMarket = newMarket;
+        this._registerMarketTokens(m, newMarket);
+        m.strategy.setMarket(newMarket);
+        this.polymarket.addSubscription(newMarket.tokenIdYes, newMarket.tokenIdNo);
+        this.polymarket.startPolling(newMarket.tokenIdYes, 1000);
+
+        await sendAlert(`🔄 [${label}] Rotated: ${newMarket.slug}`, "info");
+      });
+    } else {
+      log.warn(`[${label}] No active market found — monitoring only`);
+    }
+  }
+
+  /** Register tokenId → market mapping for book event routing. */
+  _registerMarketTokens(m, market) {
+    if (market.tokenIdYes) this.tokenToMarket.set(market.tokenIdYes, m);
+    if (market.tokenIdNo) this.tokenToMarket.set(market.tokenIdNo, m);
+  }
+
+  _unregisterMarketTokens(market) {
+    if (market.tokenIdYes) this.tokenToMarket.delete(market.tokenIdYes);
+    if (market.tokenIdNo) this.tokenToMarket.delete(market.tokenIdNo);
   }
 
   async shutdown(reason) {
-    log.warn(`\nShutting down: ${reason}`);
+    log.warn(`Shutting down: ${reason}`);
 
-    // Cancel all open orders
     if (this.executor.openOrders.size > 0) {
       log.warn(`Cancelling ${this.executor.openOrders.size} open orders...`);
       await this.executor.cancelAllOrders();
     }
 
-    // Stop discovery rotation
-    this.discovery.stop();
-
-    // Disconnect feeds
-    this.binance.disconnect();
+    for (const m of this.markets) m.discovery.stop();
+    for (const feed of this.binanceFeeds.values()) feed.disconnect();
     this.polymarket.disconnect();
 
-    // Clear status interval
     if (this.statusInterval) clearInterval(this.statusInterval);
 
-    // Final status
-    this._printStatus();
+    // Restore terminal before printing final summary
+    if (this.tui) this.tui.destroy();
 
-    // Alert
     const status = this.risk.getStatus();
+    const eStats = this.executor.getStatus();
+    console.log(`\nStopped (${reason}) — P&L: $${status.dailyPnl.toFixed(2)} | Bankroll: $${status.bankroll.toFixed(2)} | Trades: ${eStats.pnlStats.n}`);
+
     await sendAlert(
       `🛑 Engine stopped (${reason})\n` +
-      `P&L: $${status.dailyPnl.toFixed(2)} | Bankroll: $${status.bankroll.toFixed(2)} | Trades: ${status.dailyTrades}`,
+      `P&L: $${status.dailyPnl.toFixed(2)} | Bankroll: $${status.bankroll.toFixed(2)} | Trades: ${eStats.pnlStats.n}`,
       "warn"
     );
 
     process.exit(0);
   }
 
-  _printBanner() {
-    console.log(`
-\x1b[32m╔═══════════════════════════════════════════════════════════════╗
-║                                                               ║
-║   ⚡  LATENCY ARB ENGINE                                      ║
-║   ───────────────────                                         ║
-║   Binance Spot → Polymarket CLOB                              ║
-║                                                               ║
-║   Mode: ${CONFIG.execution.dryRun ? "DRY RUN (paper trading)       " : "⚠️  LIVE TRADING                "}             ║
-║   Bankroll: $${CONFIG.risk.bankroll.toFixed(2).padEnd(12)}                               ║
-║   Resolves via: Chainlink BTC/USD CEX                         ║
-║   Threshold: ${(CONFIG.strategy.entryThreshold * 100).toFixed(1)}%                                          ║
-║                                                               ║
-╚═══════════════════════════════════════════════════════════════╝\x1b[0m
-`);
-  }
-
-  _printStatus() {
+  _renderDashboard() {
+    if (!this.tui) return;
     const uptime = ((Date.now() - this.startTime) / 1000 / 60).toFixed(1);
-    const bStats = this.binance.getStats();
-    const pStats = this.polymarket.getStats();
-    const sStats = this.strategy.getStatus();
-    const rStats = this.risk.getStatus();
-    const eStats = this.executor.getStatus();
+    const pStats  = this.polymarket.getStats();
+    const rStats  = this.risk.getStatus();
+    const eStats  = this.executor.getStatus();
 
-    console.log(`
-\x1b[2m─── STATUS (uptime: ${uptime}m) ──────────────────────────────────────\x1b[0m
-  \x1b[36mFeeds\x1b[0m      Binance: ${bStats.connected ? "\x1b[32m●\x1b[0m" : "\x1b[31m●\x1b[0m"} ${bStats.messageCount} msgs (${bStats.msgRate}/s)   Poly: ${pStats.connected ? "\x1b[32m●\x1b[0m" : "\x1b[31m●\x1b[0m"} ${pStats.messageCount} msgs   REST: ${pStats.avgRestLatency}ms avg   Book: ${pStats.lastBook ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m"}
-  \x1b[36mMarket\x1b[0m     Spot: $${sStats.spotPrice?.toFixed(1) || "—"}   Strike: ${sStats.strikePrice ? "$" + sStats.strikePrice.toFixed(1) : "—"}   Contract: ${sStats.contractMid ? (sStats.contractMid * 100).toFixed(1) + "¢" : "—"}   Lag: ${sStats.feedLag != null ? sStats.feedLag + "ms" : "—"}
-  \x1b[36mStrategy\x1b[0m   Edge: ${sStats.edge ? (sStats.edge * 100).toFixed(1) + "%" : "—"}   Model: ${sStats.modelProb ? (sStats.modelProb * 100).toFixed(1) + "%" : "—"}   Vol: ${(sStats.realizedVol * 100).toFixed(2)}%   Signals: ${sStats.signalCount}
-  \x1b[36mRisk\x1b[0m       Bankroll: $${rStats.bankroll.toFixed(2)}   Drawdown: ${rStats.drawdownPct}   Open: ${rStats.openPositions}/${CONFIG.risk.maxOpenPositions}   Daily: $${rStats.dailyPnl.toFixed(2)}
-  \x1b[36mExecution\x1b[0m  Filled: ${eStats.fillRate.filled}/${eStats.fillRate.attempted}   Win: ${(eStats.last20WinRate * 100).toFixed(0)}%   Avg latency: ${eStats.avgExecutionLatency}ms
-  \x1b[36mP&L\x1b[0m        Total: $${eStats.pnlStats.sum.toFixed(2)}   Avg: $${eStats.pnlStats.mean.toFixed(2)}   Sharpe: ${eStats.pnlStats.sharpe.toFixed(2)}   Trades: ${eStats.pnlStats.n}
-\x1b[2m────────────────────────────────────────────────────────────────\x1b[0m
-`);
+    const markets = this.markets.map(m => ({
+      bStats: m.binance.getStats(),
+      sStats: m.strategy.getStatus(),
+    }));
+
+    this.tui.render({
+      uptime,
+      mode: CONFIG.execution.dryRun ? "DRY RUN" : "LIVE",
+      markets,
+      poly: { ...pStats, polls: this.polymarket._pollIntervals.size },
+      risk: { ...rStats, maxOpen: CONFIG.risk.maxOpenPositions },
+      execution: eStats,
+    });
   }
 }
 

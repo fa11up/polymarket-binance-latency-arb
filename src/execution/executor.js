@@ -118,7 +118,11 @@ export class Executor {
    */
   _monitorPosition(trade) {
     const checkInterval = 2000; // check every 2s
-    const maxHoldMs = 300000;   // 5 min max
+    // Certainty-arb trades must exit before the contract expires.
+    // Normal trades get the full 5-minute max hold.
+    const maxHoldMs = trade.signal.isCertainty
+      ? Math.max((trade.signal.expiresAt || 0) - trade.openTime, 5000)
+      : 300000;
     const profitTarget = 0.03;  // exit at 3% of contract move toward model
     const stopLoss = -0.5;      // stop at 50% loss on position
 
@@ -165,6 +169,12 @@ export class Executor {
       if (pnlPct <= stopLoss) {
         shouldExit = true;
         exitReason = "STOP_LOSS";
+      }
+
+      // Certainty-arb: force exit before contract expires
+      if (trade.signal.isCertainty && trade.signal.expiresAt && Date.now() >= trade.signal.expiresAt) {
+        shouldExit = true;
+        exitReason = "CERTAINTY_EXPIRY";
       }
 
       // Contract caught up to model (edge collapsed) — main exit

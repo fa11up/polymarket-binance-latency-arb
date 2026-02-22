@@ -8,16 +8,17 @@ const log = createLogger("BINANCE");
 /**
  * Binance spot orderbook depth feed.
  *
- * Subscribes to depth20@100ms for BTCUSDT.
+ * Subscribes to depth20@100ms for the given symbol (e.g. "btcusdt").
  * Emits:
- *   - "price"  → { bid, ask, mid, spread, timestamp, delta, volume }
+ *   - "price"  → { bid, ask, mid, spread, timestamp, delta, volume, symbol }
  *   - "error"  → Error
  *   - "close"  → void
  *
  * Auto-reconnects with exponential backoff.
  */
 export class BinanceFeed {
-  constructor() {
+  constructor(symbol) {
+    this.symbol = (symbol || "btcusdt").toLowerCase();
     this.ws = null;
     this.listeners = new Map();
     this.lastMid = null;
@@ -41,7 +42,7 @@ export class BinanceFeed {
   }
 
   connect() {
-    const stream = `${CONFIG.binance.symbol}@${CONFIG.binance.depthLevel}`;
+    const stream = `${this.symbol}@${CONFIG.binance.depthLevel}`;
     const url = `${CONFIG.binance.wsUrl}/${stream}`;
 
     log.info(`Connecting to ${url}`);
@@ -107,6 +108,7 @@ export class BinanceFeed {
     const askVol = asks.slice(0, 5).reduce((s, [, q]) => s + parseFloat(q), 0);
 
     const priceData = {
+      symbol: this.symbol,
       bid: bestBid,
       ask: bestAsk,
       mid,
@@ -144,6 +146,7 @@ export class BinanceFeed {
     const uptimeSec = this.connectedAt ? (Date.now() - this.connectedAt) / 1000 : 0;
     const msgRate = uptimeSec > 0 ? (this.messageCount / uptimeSec).toFixed(1) : "0";
     return {
+      symbol: this.symbol,
       connected: this.connected,
       messageCount: this.messageCount,
       msgRate,

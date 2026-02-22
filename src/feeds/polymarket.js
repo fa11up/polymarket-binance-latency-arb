@@ -30,13 +30,19 @@ export class PolymarketFeed {
     this.lastUpdateTime = 0;
     this.lastBook = null;
 
-    // Current token IDs (set dynamically by discovery)
+    // All subscribed token IDs across all active markets.
+    // noTokenIds is used to invert NO token book updates to YES-equivalent.
+    this._subscribedTokens = new Set();
+    this.noTokenIds = new Set();
+
+    // Legacy single-market token IDs (kept for backwards compat with connectWs auto-sub)
     this.tokenIdYes = CONFIG.poly.tokenIdYes || null;
     this.tokenIdNo = CONFIG.poly.tokenIdNo || null;
 
     // Track request timing for lag measurement
     this._restLatencies = [];
-    this._pollTokenId = null;
+    // Map<tokenId, intervalId> for per-market REST polling
+    this._pollIntervals = new Map();
   }
 
   on(event, handler) {
@@ -157,15 +163,15 @@ export class PolymarketFeed {
       this.reconnectDelay = 2000;
       log.info("Connected to Polymarket WebSocket");
 
-      // Subscribe to market events using instance token IDs
-      const assets = [this.tokenIdYes, this.tokenIdNo].filter(Boolean);
+      // Re-subscribe to all known tokens (handles reconnects)
+      const assets = [...this._subscribedTokens];
       if (assets.length > 0) {
         this.ws.send(JSON.stringify({
           type: "subscribe",
           channel: "market",
           assets_ids: assets,
         }));
-        log.info("Subscribed to market channel", { assets });
+        log.info("Subscribed to market channel", { count: assets.length });
       }
     });
 
@@ -198,44 +204,48 @@ export class PolymarketFeed {
   }
 
   /**
-   * Swap token subscriptions on an existing WS connection.
-   * Used during market rotation to switch to new 5-minute window tokens.
+   * Add a new market's tokens to the WS subscription.
+   * Called when a new market is discovered or after rotation.
    */
-  updateSubscription(tokenIdYes, tokenIdNo) {
-    // Unsubscribe from old tokens
-    if (this.ws && this.connected) {
-      const oldAssets = [this.tokenIdYes, this.tokenIdNo].filter(Boolean);
-      if (oldAssets.length > 0) {
-        this.ws.send(JSON.stringify({
-          type: "unsubscribe",
-          channel: "market",
-          assets_ids: oldAssets,
-        }));
-        log.info("Unsubscribed from old tokens", { assets: oldAssets });
-      }
-    }
+  addSubscription(tokenIdYes, tokenIdNo) {
+    [tokenIdYes, tokenIdNo].filter(Boolean).forEach(id => {
+      this._subscribedTokens.add(id);
+    });
+    if (tokenIdNo) this.noTokenIds.add(tokenIdNo);
 
-    // Update stored token IDs
-    this.tokenIdYes = tokenIdYes;
-    this.tokenIdNo = tokenIdNo;
-
-    // Subscribe to new tokens
     if (this.ws && this.connected) {
-      const newAssets = [tokenIdYes, tokenIdNo].filter(Boolean);
-      if (newAssets.length > 0) {
+      const assets = [tokenIdYes, tokenIdNo].filter(Boolean);
+      if (assets.length > 0) {
         this.ws.send(JSON.stringify({
           type: "subscribe",
           channel: "market",
-          assets_ids: newAssets,
+          assets_ids: assets,
         }));
-        log.info("Subscribed to new tokens", { assets: newAssets });
+        log.info("Subscribed to market tokens", { assets });
       }
     }
+  }
 
-    // Update polling if active
-    if (this._pollInterval && tokenIdYes) {
-      this.stopPolling();
-      this.startPolling(tokenIdYes, 1000);
+  /**
+   * Remove a market's tokens from the WS subscription.
+   * Called on market rotation to unsubscribe the expiring market.
+   */
+  removeSubscription(tokenIdYes, tokenIdNo) {
+    [tokenIdYes, tokenIdNo].filter(Boolean).forEach(id => {
+      this._subscribedTokens.delete(id);
+    });
+    if (tokenIdNo) this.noTokenIds.delete(tokenIdNo);
+
+    if (this.ws && this.connected) {
+      const assets = [tokenIdYes, tokenIdNo].filter(Boolean);
+      if (assets.length > 0) {
+        this.ws.send(JSON.stringify({
+          type: "unsubscribe",
+          channel: "market",
+          assets_ids: assets,
+        }));
+        log.info("Unsubscribed from market tokens", { assets });
+      }
     }
 
     // Clear stale book data
@@ -248,11 +258,12 @@ export class PolymarketFeed {
       const assetId = msg.asset_id;
       let book;
 
-      if (assetId && assetId === this.tokenIdNo) {
+      if (assetId && this.noTokenIds.has(assetId)) {
         // NO token update: invert prices to YES-equivalent before emitting.
         // NO_bid ↔ YES_ask (inverted), NO_ask ↔ YES_bid (inverted).
         const raw = this._parseBook(msg, 0);
         book = {
+          tokenId: assetId,
           bestBid: raw.bestAsk > 0 ? parseFloat((1 - raw.bestAsk).toFixed(4)) : 0,
           bestAsk: raw.bestBid > 0 ? parseFloat((1 - raw.bestBid).toFixed(4)) : 1,
           mid: parseFloat((1 - raw.mid).toFixed(4)),
@@ -267,6 +278,7 @@ export class PolymarketFeed {
       } else {
         // YES token update (or unknown): use as-is
         book = this._parseBook(msg, 0);
+        book.tokenId = assetId || null;
       }
 
       this.lastBook = book;
@@ -391,31 +403,39 @@ export class PolymarketFeed {
   }
 
   // ─── POLLING FALLBACK ───────────────────────────────────────────────
-  // If WebSocket is unreliable, poll the orderbook every N ms
+  // REST polling as a baseline. Supports multiple simultaneous polls
+  // (one per active market's YES token). Each book event is tagged with
+  // the polled tokenId so the ArbEngine can route it to the right strategy.
   startPolling(tokenId, intervalMs = 1000) {
-    this._pollTokenId = tokenId;
-    this._pollInterval = setInterval(async () => {
+    if (this._pollIntervals.has(tokenId)) return; // already polling this token
+    const id = setInterval(async () => {
       try {
         const book = await this.fetchOrderbook(tokenId);
+        book.tokenId = tokenId;
         this.lastBook = book;
         this.lastUpdateTime = Date.now();
         this.emit("book", book);
       } catch (err) {
-        log.error("Polling failed", { error: err.message });
+        log.error("Polling failed", { error: err.message, tokenId: tokenId.slice(0, 10) });
       }
     }, intervalMs);
-    log.info(`Started polling every ${intervalMs}ms`);
+    this._pollIntervals.set(tokenId, id);
+    log.info(`Started polling ${tokenId.slice(0, 10)}... every ${intervalMs}ms`);
   }
 
-  stopPolling() {
-    if (this._pollInterval) {
-      clearInterval(this._pollInterval);
-      this._pollInterval = null;
+  stopPolling(tokenId) {
+    if (tokenId) {
+      const id = this._pollIntervals.get(tokenId);
+      if (id) { clearInterval(id); this._pollIntervals.delete(tokenId); }
+    } else {
+      // Stop all
+      for (const id of this._pollIntervals.values()) clearInterval(id);
+      this._pollIntervals.clear();
     }
   }
 
   disconnect() {
-    this.stopPolling();
+    this.stopPolling(); // stops all
     if (this.ws) {
       this.ws.removeAllListeners();
       this.ws.close();

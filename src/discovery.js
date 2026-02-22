@@ -3,31 +3,35 @@ import { createLogger } from "./utils/logger.js";
 
 const log = createLogger("DISCOVERY");
 
-const INTERVAL_SECS = 300; // 5-minute markets
 const PRE_FETCH_MS = 5000; // fetch next market 5s before current expires
 
 /**
- * MarketDiscovery — auto-discovers and rotates BTC Up/Down 5m contracts.
+ * MarketDiscovery — auto-discovers and rotates crypto Up/Down contracts.
  *
+ * Parametrized by asset (BTC, ETH, SOL) and window length (5m, 15m).
  * Uses the Gamma API to find the current market by its predictable slug:
- *   btc-updown-5m-{unix_timestamp}
+ *   {asset}-updown-{window}m-{unix_timestamp}
  *
- * where the unix timestamp is aligned to 300-second boundaries.
+ * where the unix timestamp is aligned to (windowMins × 60)-second boundaries.
+ * All contracts resolve via Chainlink CEX aggregated price feeds.
  */
 export class MarketDiscovery {
-  constructor() {
+  constructor(asset, windowMins) {
+    this.asset = asset.toLowerCase();
+    this.windowMins = windowMins;
+    this.intervalSecs = windowMins * 60;
     this._rotationTimer = null;
     this.currentMarket = null;
   }
 
-  /** Floor a unix timestamp (seconds) to the nearest 5-minute boundary. */
+  /** Floor a unix timestamp (seconds) to the nearest window boundary. */
   _alignToInterval(tsSec) {
-    return Math.floor(tsSec / INTERVAL_SECS) * INTERVAL_SECS;
+    return Math.floor(tsSec / this.intervalSecs) * this.intervalSecs;
   }
 
   /** Build the Gamma API slug for a given aligned timestamp. */
   _buildSlug(alignedTs) {
-    return `btc-updown-5m-${alignedTs}`;
+    return `${this.asset}-updown-${this.windowMins}m-${alignedTs}`;
   }
 
   /**
@@ -63,6 +67,8 @@ export class MarketDiscovery {
       }
 
       const market = {
+        asset: this.asset.toUpperCase(),
+        windowMins: this.windowMins,
         conditionId: data.conditionId,
         tokenIdYes: tokenIds[0],
         tokenIdNo: tokenIds[1],
@@ -88,14 +94,14 @@ export class MarketDiscovery {
 
   /**
    * Find the current active market.
-   * Tries the current 5-minute window first; if that market is expired/closed,
+   * Tries the current window first; if that market is expired/closed,
    * tries the next window.
    */
   async findCurrentMarket() {
     const nowSec = Math.floor(Date.now() / 1000);
     const currentTs = this._alignToInterval(nowSec);
 
-    log.info(`Looking for market at window ${currentTs} (${new Date(currentTs * 1000).toISOString()})`);
+    log.info(`[${this.asset.toUpperCase()}/${this.windowMins}m] Looking for market at window ${currentTs} (${new Date(currentTs * 1000).toISOString()})`);
 
     // Try current window
     let market = await this.fetchMarket(currentTs);
@@ -105,7 +111,7 @@ export class MarketDiscovery {
     }
 
     // Current window closed/expired — try next window
-    const nextTs = currentTs + INTERVAL_SECS;
+    const nextTs = currentTs + this.intervalSecs;
     log.info(`Current window closed, trying next: ${nextTs} (${new Date(nextTs * 1000).toISOString()})`);
     market = await this.fetchMarket(nextTs);
     if (market) {
@@ -113,7 +119,7 @@ export class MarketDiscovery {
       return market;
     }
 
-    log.warn("No active market found in current or next window");
+    log.warn(`[${this.asset.toUpperCase()}/${this.windowMins}m] No active market found in current or next window`);
     return null;
   }
 
@@ -138,15 +144,15 @@ export class MarketDiscovery {
     const rotateAt = endMs - PRE_FETCH_MS;
     const delay = Math.max(rotateAt - Date.now(), 1000); // at least 1s from now
 
-    log.info(`Next rotation in ${(delay / 1000).toFixed(0)}s (market ends ${this.currentMarket.endDate})`);
+    log.info(`[${this.asset.toUpperCase()}/${this.windowMins}m] Next rotation in ${(delay / 1000).toFixed(0)}s (market ends ${this.currentMarket.endDate})`);
 
     this._rotationTimer = setTimeout(async () => {
       try {
         // Compute the next window timestamp
         const endSec = Math.floor(endMs / 1000);
-        const nextTs = this._alignToInterval(endSec) + INTERVAL_SECS;
+        const nextTs = this._alignToInterval(endSec) + this.intervalSecs;
 
-        log.info(`Rotating to next market window: ${nextTs}`);
+        log.info(`[${this.asset.toUpperCase()}/${this.windowMins}m] Rotating to next market window: ${nextTs}`);
         const nextMarket = await this.fetchMarket(nextTs);
 
         if (nextMarket) {
@@ -163,14 +169,12 @@ export class MarketDiscovery {
               this._scheduleNext(onNewMarket);
             } else {
               log.error("Failed to find next market after retry");
-              // Keep trying every 30s
               this._scheduleNext(onNewMarket);
             }
           }, 10000);
         }
       } catch (err) {
         log.error("Rotation failed", { error: err.message });
-        // Schedule retry
         this._rotationTimer = setTimeout(() => this._scheduleNext(onNewMarket), 15000);
       }
     }, delay);

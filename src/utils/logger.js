@@ -25,29 +25,38 @@ function formatMsg(level, tag, msg, data) {
   return `${prefix} ${msg}${dataStr}`;
 }
 
+// When a TUI is active, all log output routes here instead of stdout.
+let _logSink = null;
+export function setLogSink(fn) { _logSink = fn; }
+
+function emit(line) {
+  if (_logSink) _logSink(line);
+  else console.log(line);
+}
+
 class Logger {
   constructor(tag) {
     this.tag = tag;
   }
 
   debug(msg, data) {
-    if (currentLevel <= LEVELS.debug) console.log(formatMsg("debug", this.tag, msg, data));
+    if (currentLevel <= LEVELS.debug) emit(formatMsg("debug", this.tag, msg, data));
   }
 
   info(msg, data) {
-    if (currentLevel <= LEVELS.info) console.log(formatMsg("info", this.tag, msg, data));
+    if (currentLevel <= LEVELS.info) emit(formatMsg("info", this.tag, msg, data));
   }
 
   warn(msg, data) {
-    if (currentLevel <= LEVELS.warn) console.warn(formatMsg("warn", this.tag, msg, data));
+    if (currentLevel <= LEVELS.warn) emit(formatMsg("warn", this.tag, msg, data));
   }
 
   error(msg, data) {
-    console.error(formatMsg("error", this.tag, msg, data));
+    emit(formatMsg("error", this.tag, msg, data));
   }
 
   trade(msg, data) {
-    if (currentLevel <= LEVELS.trade) console.log(formatMsg("trade", this.tag, msg, data));
+    if (currentLevel <= LEVELS.trade) emit(formatMsg("trade", this.tag, msg, data));
   }
 }
 

@@ -7,9 +7,15 @@ const log = createLogger("STRATEGY");
 /**
  * Strategy engine.
  *
- * Computes the theoretical probability that BTC finishes above the strike
- * using the Binance spot price, compares it to the Polymarket contract
- * price, and generates trade signals when the edge exceeds the threshold.
+ * Parametrized by asset (BTC, ETH, SOL) and window length in minutes (5, 15).
+ * Computes the theoretical probability that the asset finishes above/below
+ * the opening strike using Binance spot price, compares to the Polymarket
+ * contract mid, and generates signals when edge exceeds the threshold.
+ *
+ * Two signal modes:
+ *   1. Latency-arb (t > 90s): exploits 3-7s repricing lag
+ *   2. Certainty-arb (0 < t ≤ 90s): exploits slow repricing as outcome
+ *      becomes certain; requires higher edge, uses smaller size
  *
  * Signal flow:
  *   1. Binance tick → update spot price, delta, vol estimate
@@ -19,7 +25,12 @@ const log = createLogger("STRATEGY");
  *   5. Risk manager validates → execution layer fires
  */
 export class Strategy {
-  constructor() {
+  constructor(asset = "BTC", windowMins = 5) {
+    this.asset = asset.toUpperCase();
+    this.windowMins = windowMins;
+    this.windowMs = windowMins * 60_000;
+    this.label = `${this.asset}/${this.windowMins}m`;
+
     // Latest market state
     this.spotPrice = null;
     this.spotDelta = 0;
@@ -48,8 +59,8 @@ export class Strategy {
     this.tokenIdNo = CONFIG.poly.tokenIdNo || null;
     this.marketEndDate = null; // ISO string, set by setMarket()
 
-    // Dynamic strike: BTC spot price at market open (captured on first tick after setMarket)
-    // For btc-updown-5m contracts the strike is the opening price, not a fixed level.
+    // Dynamic strike: spot price at market open (captured on first tick after setMarket)
+    // For updown contracts the strike is the opening price, not a fixed level.
     this.marketOpenStrike = null;
 
     // Tracks how many market rotations have occurred.
@@ -70,14 +81,14 @@ export class Strategy {
     this.tokenIdYes = tokenIdYes;
     this.tokenIdNo = tokenIdNo;
     this.marketEndDate = endDate;
-    // Window start = endDate minus 5-minute interval
+    // Window start = endDate minus the window interval
     this.marketWindowStart = endDate
-      ? new Date(endDate).getTime() - 300_000
+      ? new Date(endDate).getTime() - this.windowMs
       : null;
     this.marketOpenStrike = null; // captured on first spot tick after window opens
     this.marketSetCount++;
     const isStartup = this.marketSetCount === 1;
-    log.info("Market updated", {
+    log.info(`[${this.label}] Market updated`, {
       tokenIdYes: tokenIdYes?.slice(0, 10) + "...",
       endDate,
       windowStart: this.marketWindowStart
@@ -102,7 +113,7 @@ export class Strategy {
     const windowOpen = !this.marketWindowStart || Date.now() >= this.marketWindowStart;
     if (this.marketOpenStrike === null && this.marketEndDate !== null && windowOpen) {
       this.marketOpenStrike = data.mid;
-      log.info("Market open strike captured", {
+      log.info(`[${this.label}] Market open strike captured`, {
         strike: `$${data.mid.toFixed(2)}`,
         market: this.marketEndDate,
       });
@@ -154,98 +165,138 @@ export class Strategy {
     const { entryThreshold, dailyVol } = CONFIG.strategy;
     const strikePrice = this.marketOpenStrike;
 
-    // Suppress signals in the last 60s: the book empties near expiry, creating
-    // artificial price dislocations that look like edge but resolve randomly.
-    const hoursToExpiry = this._estimateHoursToExpiry();
-    if (hoursToExpiry < 1 / 60) return;
-
-    // Use EMA-smoothed vol or fallback to config
     const vol = this.volEma.value || dailyVol;
+    const hoursToExpiry = this._estimateHoursToExpiry();
 
+    // Route to appropriate signal mode based on time remaining
+    if (hoursToExpiry <= 0) return; // expired
+
+    const secsToExpiry = hoursToExpiry * 3600;
+    if (secsToExpiry <= 90) {
+      // Certainty-arb window (0–90s): book thins, but large moves create genuine edge
+      this._evaluateCertainty(hoursToExpiry, vol);
+      return;
+    }
+
+    // Normal latency-arb (t > 90s)
     const modelProb = impliedProbability(this.spotPrice, strikePrice, vol, hoursToExpiry);
-
-    // Calculate edge vs contract price
     const edge = calculateEdge(modelProb, this.contractMid);
-
-    // EMA-smooth the edge to reject noise
     const smoothedEdge = this.edgeEma.update(edge.absolute);
-
-    // Track edge statistics
     this.edgeStats.push(edge.absolute);
 
-    // Lag between feeds
     const feedLag = Math.abs(this.lastSpotUpdate - this.lastContractUpdate);
-
-    // ─── SIGNAL GENERATION ────────────────────────────────────────────
-    // Only signal when:
-    //   1. Smoothed edge exceeds threshold
-    //   2. Raw edge also exceeds threshold (confirm, not just EMA artifact)
-    //   3. Contract update is stale (indicating the lag window is open)
-    //   4. Sufficient liquidity on the book
     const isStale = feedLag > 1000; // contract at least 1s behind spot
     const edgeConfirmed = smoothedEdge >= entryThreshold && edge.absolute >= entryThreshold;
 
     if (edgeConfirmed && isStale && this._onSignal) {
-      // Calculate position size
-      const sizing = calculatePositionSize(
-        CONFIG.risk.bankroll,
-        edge,
-        this.contractMid,
-        CONFIG.risk
-      );
-
-      if (!sizing) return; // Kelly says don't bet
-
-      // Determine which token to buy and at what price
-      const tokenId = edge.direction === "BUY_YES"
-        ? this.tokenIdYes
-        : this.tokenIdNo;
-
-      // Entry price: use best ask for buys (taking liquidity)
-      const entryPrice = edge.direction === "BUY_YES"
-        ? this.contractBestAsk || this.contractMid + 0.005
-        : (1 - (this.contractBestBid || this.contractMid - 0.005));
-
-      const availableLiquidity = edge.direction === "BUY_YES"
-        ? this.contractAskDepth
-        : this.contractBidDepth;
-
-      const signal = {
-        timestamp: Date.now(),
-        direction: edge.direction,
-        tokenId,
-        entryPrice,
-        size: sizing.netSize,
-        rawSize: sizing.rawSize,
-        edge: edge.absolute,
-        smoothedEdge: smoothedEdge,
-        modelProb,
-        contractPrice: this.contractMid,
-        spotPrice: this.spotPrice,
-        strikePrice: this.marketOpenStrike,
-        feedLag,
-        vol,
-        kelly: sizing.kelly,
-        odds: sizing.odds,
-        slippage: sizing.slippage,
-        fee: sizing.fee,
-        availableLiquidity,
-        hoursToExpiry,
-      };
-
-      this.signalCount++;
-      log.info("Signal generated", {
-        direction: signal.direction,
-        edge: `${(signal.edge * 100).toFixed(1)}%`,
-        model: `${(modelProb * 100).toFixed(1)}%`,
-        contract: `${(this.contractMid * 100).toFixed(1)}¢`,
-        spot: `$${this.spotPrice.toFixed(1)}`,
-        lag: `${feedLag}ms`,
-        size: `$${signal.size.toFixed(2)}`,
-      });
-
-      this._onSignal(signal);
+      this._fireSignal({ edge, modelProb, smoothedEdge, feedLag, vol, hoursToExpiry, isCertainty: false });
     }
+  }
+
+  /**
+   * Certainty-arb: last 90 seconds of the window.
+   * Polymarket often lags badly here as traders withdraw orders.
+   * If price has moved materially from strike, edge can be massive.
+   */
+  _evaluateCertainty(hoursToExpiry, vol) {
+    const { certaintyThreshold, certaintyMaxFraction } = CONFIG.strategy;
+    const strikePrice = this.marketOpenStrike;
+
+    const modelProb = impliedProbability(this.spotPrice, strikePrice, vol, hoursToExpiry);
+    const edge = calculateEdge(modelProb, this.contractMid);
+
+    // Track edge even in certainty mode
+    this.edgeStats.push(edge.absolute);
+    this.edgeEma.update(edge.absolute);
+
+    // Require large edge — the book is thin and execution slippage is elevated
+    if (edge.absolute < certaintyThreshold) return;
+
+    const feedLag = Math.abs(this.lastSpotUpdate - this.lastContractUpdate);
+    if (feedLag < 1000) return; // still need to see staleness
+
+    const msRemaining = new Date(this.marketEndDate).getTime() - Date.now();
+    if (msRemaining < 5000) return; // too close to expiry for safe execution
+
+    const smallRisk = { ...CONFIG.risk, maxBetFraction: certaintyMaxFraction };
+    const sizing = calculatePositionSize(CONFIG.risk.bankroll, edge, this.contractMid, smallRisk);
+    if (!sizing) return;
+
+    const expiresAt = Date.now() + Math.max(msRemaining - 5000, 1000);
+
+    this._fireSignal({
+      edge,
+      modelProb,
+      smoothedEdge: this.edgeEma.value,
+      feedLag,
+      vol,
+      hoursToExpiry,
+      isCertainty: true,
+      expiresAt,
+      sizingOverride: sizing,
+    });
+  }
+
+  _fireSignal({ edge, modelProb, smoothedEdge, feedLag, vol, hoursToExpiry, isCertainty, expiresAt, sizingOverride }) {
+    if (!this._onSignal) return;
+
+    const sizing = sizingOverride || calculatePositionSize(
+      CONFIG.risk.bankroll,
+      edge,
+      this.contractMid,
+      CONFIG.risk
+    );
+    if (!sizing) return;
+
+    const tokenId = edge.direction === "BUY_YES" ? this.tokenIdYes : this.tokenIdNo;
+    const entryPrice = edge.direction === "BUY_YES"
+      ? this.contractBestAsk || this.contractMid + 0.005
+      : (1 - (this.contractBestBid || this.contractMid - 0.005));
+    const availableLiquidity = edge.direction === "BUY_YES"
+      ? this.contractAskDepth
+      : this.contractBidDepth;
+
+    const signal = {
+      timestamp: Date.now(),
+      asset: this.asset,
+      windowMins: this.windowMins,
+      label: this.label,
+      direction: edge.direction,
+      isCertainty: isCertainty || false,
+      ...(expiresAt && { expiresAt }),
+      tokenId,
+      entryPrice,
+      size: sizing.netSize,
+      rawSize: sizing.rawSize,
+      edge: edge.absolute,
+      smoothedEdge,
+      modelProb,
+      contractPrice: this.contractMid,
+      spotPrice: this.spotPrice,
+      strikePrice: this.marketOpenStrike,
+      feedLag,
+      vol,
+      kelly: sizing.kelly,
+      odds: sizing.odds,
+      slippage: sizing.slippage,
+      fee: sizing.fee,
+      availableLiquidity,
+      hoursToExpiry,
+    };
+
+    this.signalCount++;
+    log.info(`[${this.label}] ${isCertainty ? "Certainty" : "Signal"} generated`, {
+      direction: signal.direction,
+      edge: `${(signal.edge * 100).toFixed(1)}%`,
+      model: `${(modelProb * 100).toFixed(1)}%`,
+      contract: `${(this.contractMid * 100).toFixed(1)}¢`,
+      spot: `$${this.spotPrice.toFixed(2)}`,
+      lag: `${feedLag}ms`,
+      size: `$${signal.size.toFixed(2)}`,
+      ...(isCertainty && { secsLeft: Math.round(hoursToExpiry * 3600) }),
+    });
+
+    this._onSignal(signal);
   }
 
   _estimateHoursToExpiry() {
@@ -276,8 +327,12 @@ export class Strategy {
       : null;
 
     return {
+      label: this.label,
+      asset: this.asset,
+      windowMins: this.windowMins,
       spotPrice: this.spotPrice,
       strikePrice,
+      marketEndDate: this.marketEndDate,
       contractMid: this.contractMid,
       modelProb,
       edge: edge?.absolute,

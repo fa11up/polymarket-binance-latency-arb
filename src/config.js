@@ -21,6 +21,14 @@ function envBool(key, fallback = false) {
   return raw === "true" || raw === "1";
 }
 
+// Binance symbol for each supported asset
+const SYMBOL_MAP = {
+  BTC: "btcusdt",
+  ETH: "ethusdt",
+  SOL: "solusdt",
+  XRP: "xrpusdt"
+};
+
 export const CONFIG = Object.freeze({
   // ─── Polymarket CLOB ──────────────────────────────────────────────
   poly: {
@@ -40,18 +48,33 @@ export const CONFIG = Object.freeze({
   // ─── Binance ──────────────────────────────────────────────────────
   binance: {
     wsUrl: "wss://stream.binance.us:9443/ws",
-    symbol: "btcusdt",
     depthLevel: "depth20@100ms",
   },
 
+  // ─── Markets ──────────────────────────────────────────────────────
+  // Assets (comma-separated) and window sizes in minutes to monitor.
+  // Each (asset × window) pair runs its own discovery + strategy instance.
+  // Defaults to BTC 5m only. Example: ASSETS=BTC,ETH,SOL WINDOWS=5,15
+  markets: {
+    assets: env("ASSETS", "BTC").split(",").map(s => s.trim().toUpperCase()),
+    windows: env("WINDOWS", "5").split(",").map(Number),
+    symbolMap: Object.fromEntries(
+      Object.keys(SYMBOL_MAP).map(k => [k, env(`${k}_SYMBOL`, SYMBOL_MAP[k])])
+    ),
+  },
+
   // ─── Strategy ─────────────────────────────────────────────────────
-  // Strike price is NOT static — it is captured dynamically at each 5-minute
-  // window open from the first Binance tick (proxy for the Chainlink BTC/USD
-  // CEX aggregated price that Polymarket uses for contract resolution).
+  // Strike price is NOT static — it is captured dynamically at each window
+  // open from the first Binance tick (proxy for the Chainlink BTC/USD CEX
+  // aggregated price that Polymarket uses for contract resolution).
   strategy: {
     entryThreshold: envNum("ENTRY_THRESHOLD", 0.03),
     minEdge: envNum("MIN_EDGE", 0.03),
     dailyVol: 0.015,  // 1.5% BTC daily vol assumption — tune to realized
+    // Certainty-arb mode: trades in the last 90s as outcome approaches certainty.
+    // Higher threshold required — book is thin and execution risk is elevated.
+    certaintyThreshold: envNum("CERTAINTY_THRESHOLD", 0.15),
+    certaintyMaxFraction: envNum("CERTAINTY_MAX_FRACTION", 0.02),
   },
 
   // ─── Risk ─────────────────────────────────────────────────────────
