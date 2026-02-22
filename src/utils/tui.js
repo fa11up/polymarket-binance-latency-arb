@@ -67,6 +67,7 @@ export class TUI {
       tags: false,
       scrollable: true,
       alwaysScroll: true,
+      scrollback: 500,  // cap line buffer — prevents unbounded memory growth
       scrollbar: { ch: "▐", style: { fg: "cyan" } },
       mouse: true,
       keys: true,

@@ -22,8 +22,7 @@ export class Executor {
     this.risk = riskManager;
 
     // Active orders
-    this.openOrders = new Map();    // orderId → order
-    this.filledTrades = new Map();  // tradeId → trade with fill info
+    this.openOrders = new Map(); // orderId → trade
 
     // Stats
     this.pnlStats = new RunningStats();
@@ -127,6 +126,12 @@ export class Executor {
     const stopLoss = -0.5;      // stop at 50% loss on position
 
     const monitor = setInterval(async () => {
+      // Stop if this trade was cancelled externally (e.g. market rotation).
+      if (!this.openOrders.has(trade.id)) {
+        clearInterval(monitor);
+        return;
+      }
+
       const age = Date.now() - trade.openTime;
 
       // Fetch this position's specific token book directly (not shared state).
@@ -277,10 +282,14 @@ export class Executor {
     for (const trade of matches) {
       try {
         await this.poly.cancelOrder(trade.id);
-        this.openOrders.delete(trade.id);
       } catch (err) {
         log.error(`Failed to cancel order ${trade.id}`, { error: err.message });
       }
+      // Clean up both executor and risk manager state.
+      // Must happen regardless of cancel success — the market is rotating and
+      // these positions can no longer be monitored or exited.
+      this.openOrders.delete(trade.id);
+      this.risk.closePosition(trade.id, 0); // 0 P&L for cancelled unfilled order
     }
   }
 
