@@ -14,7 +14,7 @@ Exploits the 3-7 second lag between Binance spot price updates and Polymarket CL
 │  │              │    │              │    │                  │  │
 │  │  1 WS per    │    │  WS + REST   │    │  1 per market    │  │
 │  │  asset       │    │  1s polling  │    │  implied prob    │  │
-│  │  depth20@    │    │  per market  │    │  edge calc       │  │
+│  │  depth20@    │    │  per market  │    │  dynamic thresh  │  │
 │  │  100ms       │    │  tokenId     │    │  signal gen      │  │
 │  └──────────────┘    │  routing     │    └────────┬─────────┘  │
 │                      └──────────────┘             │            │
@@ -22,7 +22,7 @@ Exploits the 3-7 second lag between Binance spot price updates and Polymarket CL
 │  ┌──────────────┐    ┌──────────────┐   │    RISK          │  │
 │  │   ALERTS      │◀───│  EXECUTOR    │◀──│    MANAGER       │  │
 │  │              │    │              │   │                  │  │
-│  │  Discord     │    │  order mgmt  │   │  position limits │  │
+│  │  Discord     │    │  maker/taker │   │  position limits │  │
 │  │  Telegram    │    │  fill track  │   │  drawdown kill   │  │
 │  │              │    │  P&L calc    │   │  daily limits    │  │
 │  └──────────────┘    └──────────────┘   └──────────────────┘  │
@@ -32,15 +32,13 @@ Exploits the 3-7 second lag between Binance spot price updates and Polymarket CL
 ## Signal Flow
 
 1. **Binance tick** (every 100ms): spot price, delta, realized vol — one feed per asset
-2. **Strategy eval**: compute implied probability via binary option model (N(d2))
-3. **Edge detection**: compare model prob vs Polymarket contract mid
-4. **Signal guards**: suppress startup window and pre-window signals; route last 90s to certainty-arb mode
-5. **Signal generation** (two modes):
-   - *Latency-arb* (t > 90s): edge > 5% (5m) / 3% (15m) AND contract stale >1s; blocked when N(d2) > 90% (model saturation) or feedLag > 5s (stale REST data)
-   - *Certainty-arb* (0 < t ≤ 90s): edge > 15% as outcome approaches certainty; half-size; force-exits before expiry; skips if token-side price < 15¢ (phantom edge guard)
-6. **Risk check**: position limits, drawdown, cooldown, liquidity
-7. **Execution**: place order on Polymarket CLOB; poll for fill confirmation
-8. **Monitoring**: track position, exit on edge collapse / timeout / stop loss / expiry
+2. **Strategy eval**: compute implied probability via binary option model (N(d2)); apply calibration adjustment if sufficient history exists
+3. **Dynamic threshold**: widen entry bar when spread > 4c, book depth < $20, or vol > 2× base
+4. **Edge detection**: compare calibrated model prob vs Polymarket executable fill price (best ask / best bid)
+5. **Signal guards**: suppress startup window and pre-window signals; suppress when N(d2) > 90% (model saturation) or feedLag > 5s (stale REST data)
+6. **Risk check**: position limits, drawdown, cooldown, liquidity auto-scaling, fill probability gate
+7. **Execution**: maker order on wide spreads with time remaining; taker otherwise; reprices up to 2× before falling through
+8. **Monitoring**: track position, exit on edge collapse / timeout / stop loss / profit target
 
 ## Setup
 
@@ -71,15 +69,13 @@ All configuration is in `.env`. Key parameters:
 | `ASSETS` | `BTC` | Comma-separated assets to monitor (BTC, ETH, SOL, XRP) |
 | `WINDOWS` | `5` | Comma-separated window sizes in minutes (5, 15) |
 | `BANKROLL` | 1300 | Starting capital in USD |
-| `ENTRY_THRESHOLD` | 0.05 | Minimum edge (5%) for 5m latency-arb trades (raised — thin books near noise floor) |
-| `ENTRY_THRESHOLD_15M` | 0.03 | Minimum edge (3%) for 15m trades (lower — more liquidity near 50¢) |
-| `CERTAINTY_THRESHOLD` | 0.15 | Minimum edge (15%) for certainty-arb in last 90s |
-| `CERTAINTY_MAX_FRACTION` | 0.02 | Kelly cap for certainty-arb positions (2% of bankroll) |
+| `ENTRY_THRESHOLD` | 0.08 | Minimum edge (8%) for 5m latency-arb trades |
+| `ENTRY_THRESHOLD_15M` | 0.04 | Minimum edge (4%) for 15m trades |
 | `MAX_BET_FRACTION` | 0.04 | Kelly fraction cap (4% of bankroll) |
 | `MAX_POSITION_USD` | 100 | Max USD per single trade |
 | `MAX_OPEN_POSITIONS` | 8 | Concurrent position limit |
 | `DAILY_LOSS_LIMIT` | 50 | Stop trading after this many USD lost in a day |
-| `PROFIT_TARGET_PCT` | 0.08 | Exit a position when it reaches 8% profit |
+| `PROFIT_TARGET_PCT` | 0.03 | Exit a position when it reaches 3% profit |
 | `STOP_LOSS_PCT` | 0.15 | Exit a position at 15% loss |
 | `COOLDOWN_MS` | 3000 | Minimum ms between trades (stamped atomically) |
 | `SLIPPAGE_BPS` | 15 | Expected slippage in basis points |
@@ -94,23 +90,33 @@ All configuration is in `.env`. Key parameters:
 ## Risk Controls
 
 - **Kelly Criterion**: Half-Kelly sizing with configurable cap; uses live bankroll (not static startup value)
-- **Max Drawdown Kill Switch**: Auto-stops at 25% drawdown from peak; sticky — does not reset
+- **Max Drawdown Kill Switch**: Auto-stops at 25% drawdown from peak; resets to current bankroll on each startup
 - **Daily Loss Limit**: Stops trading after `DAILY_LOSS_LIMIT` USD lost (resets at UTC midnight)
 - **Position Limits**: Max concurrent positions and per-trade USD cap; per-market stacking prevented
 - **Cooldown**: Minimum ms between trades, stamped atomically in `canTrade()` to prevent races
-- **Liquidity Check**: Rejects signals if available book depth is below position size; relaxed threshold for certainty-arb
-- **Model Saturation Guard**: Suppresses latency-arb signals when N(d2) > 90% — in tiny-T regime the Chainlink oracle's ~1-min TWAP means apparent edge is not real
+- **Liquidity Auto-Scaling**: Scales position size to 75% of available book depth rather than hard-blocking; blocks only when scaled size falls below $5 floor
+- **Fill Probability Gate**: Tracks historical fill rates bucketed by spread/depth; gates signals with < 30% observed fill probability
+- **Dynamic Thresholds**: Entry bar widens automatically when spread > 4c (+half the excess), depth < $20 (+2%), or vol > 2× base (+1%)
+- **Model Saturation Guard**: Suppresses signals when N(d2) > 90% — in the tiny-T regime the Chainlink oracle's ~1-min TWAP means apparent edge is not real
 - **Stale Contract Guard**: Suppresses signals when feedLag > 5s — beyond that the lag reflects a REST polling failure, not genuine Polymarket repricing
-- **Certainty-Arb Price Guard**: Skips certainty entry if the token side we'd buy is below 15¢ — at those prices the market has committed to the outcome and BS vol underestimates near-expiry certainty, producing phantom edge
-- **Per-Asset Vol Calibration**: Each asset uses its own daily vol seed (`BTC_VOL` … `XRP_VOL`) pre-seeded from recent 1m Binance klines at startup, preventing phantom 20-24% edge on high-vol assets from BTC vol assumptions
+- **Per-Asset Vol Calibration**: Each asset uses its own daily vol seed pre-seeded from recent 1m Binance klines at startup, preventing phantom 20-24% edge on high-vol assets
 - **Unhandled Rejection Kill Switch**: 5+ unhandled promise rejections in a 60s sliding window halts trading
 - **Shutdown Accounting**: On shutdown, open positions are marked to current book mid (`estimated: true`) — no forced break-even
+
+## Signal Quality & Calibration
+
+The engine continuously logs every evaluation to `data/features.ndjson` (outcome, edge, microstructure, vol) and every trade to `data/trades.ndjson`. These are used for:
+
+- **Calibration** (`src/engine/calibration.js`): Once 200+ fired signals accumulate, a binned correction table adjusts raw BS N(d2) probabilities toward observed win rates. Blend weight ramps conservatively (max 50%).
+- **Adverse selection analysis**: P&L checkpoints at 5s/15s/30s after entry detect whether the arb is real or whether we're being picked off by informed flow.
+- **Offline analysis**: `scripts/analyze-calibration.js` prints reliability diagrams and Brier scores.
 
 ## Multi-Market Support
 
 The engine runs one `MarketDiscovery` + `Strategy` instance per `(asset × window)` pair, sharing a single `PolymarketFeed`, deduplicated `BinanceFeed` per asset, and a single `RiskManager`.
 
 - **Discovery**: Auto-discovers contracts via Gamma API slug pattern (`{asset}-updown-{window}m-{unix_timestamp}` aligned to window boundaries). Rotates 5s before expiry.
+- **Strike price**: Fetched from Chainlink AggregatorV3 on Polygon at window open (2s delay for round finalization). Falls back to first Binance tick on failure.
 - **Book routing**: Every Polymarket book event is tagged with `tokenId` and routed to the correct strategy via `tokenToMarket` map.
 - **Rotation safety**: On rotation, only the expiring market's open orders are cancelled (not all markets). Old tokens are unsubscribed; new tokens are subscribed and polling starts immediately.
 
@@ -127,20 +133,33 @@ src/
 │   ├── binance.js           # Binance depth WebSocket (depth20@100ms)
 │   └── polymarket.js        # Polymarket CLOB WS + REST polling (429 retry)
 ├── engine/
-│   ├── strategy.js          # Signal generation (latency-arb + certainty-arb)
-│   └── risk.js              # Risk management (limits, kill switch, partial-close accounting)
+│   ├── strategy.js          # Signal generation (latency-arb, dynamic thresholds)
+│   ├── risk.js              # Risk management (limits, kill switch, partial-close accounting)
+│   └── calibration.js       # Binned BS probability correction from historical outcomes
 ├── execution/
-│   └── executor.js          # Order placement, fill confirmation, position monitoring
+│   └── executor.js          # Order placement, maker/reprice, fill tracking, position monitoring
 └── utils/
     ├── logger.js            # Structured logging with TUI sink
     ├── math.js              # Probability, Kelly, statistics
     ├── alerts.js            # Discord/Telegram alerts
     ├── tui.js               # blessed terminal dashboard
     ├── tradeLog.js          # Append-only NDJSON trade audit log (data/trades.ndjson)
+    ├── featureLog.js        # Per-evaluation feature log (data/features.ndjson)
+    ├── chainlink.js         # Chainlink AggregatorV3 strike fetch (Polygon RPC)
     └── stateStore.js        # JSON crash-recovery state (data/state.json)
 
 tests/
-└── executor.test.js         # 24 tests (node:test built-in)
+├── executor.test.js         # Executor, RiskManager, FillTracker tests
+├── strategy.test.js         # Strategy signal guards and dynamic threshold tests
+├── featureLog.test.js       # Feature logging outcome and throttle tests
+├── feeds.test.js            # Binance/Polymarket feed parsing tests
+├── math.test.js             # Math utility tests (impliedProbability, Kelly, etc.)
+└── chainlink.test.js        # Chainlink strike fetch tests
+
+data/                        # Runtime data (gitignored)
+├── trades.ndjson            # Trade audit log
+├── features.ndjson          # Per-evaluation feature log (for calibration)
+└── state.json               # Crash-recovery state
 
 .claude/skills/audit/
 └── SKILL.md                 # /audit skill — runs dry-mode analysis and generates a structured report
@@ -152,22 +171,17 @@ tests/
 npm test
 ```
 
-Uses Node.js built-in `node:test`. No external test framework required. Coverage includes: partial fill handling, fill timeout, partial-exit risk accounting, cumulative P&L, shutdown mark-to-market, monitor race conditions, idempotent finalization, `canTrade` kill conditions, liquidity rules, cooldown reservation, and per-market order isolation.
+Uses Node.js built-in `node:test` — no external framework required. 84 tests across 6 test files covering: partial fill handling, fill timeout, partial-exit risk accounting, cumulative P&L, shutdown mark-to-market, monitor race conditions, idempotent finalization, `canTrade` kill conditions, liquidity auto-scaling, fill probability gating, cooldown reservation, per-market order isolation, dynamic thresholds, feature log outcomes/throttle, feed parsing, math utilities, and Chainlink strike fetch.
 
 ## Realistic Expectations
 
 This is **not** a money printer. Real-world constraints:
 
-- **Liquidity**: Most Polymarket contracts have $50-500 at any price level
+- **Liquidity**: Most Polymarket contracts have $50-500 at any price level; auto-scaling trades thinner books at reduced size rather than skipping them
 - **Competition**: Market makers also watch Binance — you're racing them
 - **Availability**: Contracts aren't always available or liquid across all assets
 - **Slippage**: Your order moves the book, especially at size
-- **Resolution**: Contracts resolve at specific times via Chainlink CEX aggregated price
-
-Expected realistic performance:
-- Win rate: 55-65% (not 95%)
-- Edge per trade: 2-8% (not 20-50%)
-- Trades per day: 5-20 per market pair
+- **Resolution**: Contracts resolve via Chainlink CEX aggregated price (AggregatorV3 on Polygon)
 
 ## Disclaimer
 
