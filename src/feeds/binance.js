@@ -94,6 +94,7 @@ export class BinanceFeed {
 
     const bestBid = parseFloat(bids[0][0]);
     const bestAsk = parseFloat(asks[0][0]);
+    if (!isFinite(bestBid) || !isFinite(bestAsk) || bestBid <= 0 || bestAsk <= 0) return;
     const mid = (bestBid + bestAsk) / 2;
     const spread = bestAsk - bestBid;
 

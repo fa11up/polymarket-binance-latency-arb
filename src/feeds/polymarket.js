@@ -41,6 +41,13 @@ export class PolymarketFeed {
     this._restLatencies = [];
     // Map<tokenId, intervalId> for per-market REST polling
     this._pollIntervals = new Map();
+
+    // ─── User channel WS (fill/order events) ─────────────────────────
+    this.userWs = null;
+    this.userWsConnected = false;
+    this.userWsReconnectDelay = 2000;
+    this._userSubscribedConditions = new Set();
+    this._pendingFills = new Map(); // orderId → { resolve }
   }
 
   on(event, handler) {
@@ -111,6 +118,17 @@ export class PolymarketFeed {
 
       return await resp.json();
     } catch (err) {
+      // Retry on transient network errors (dropped connection, OS abort, DNS failure).
+      // Short backoff: 250ms/500ms/1s ± jitter — distinct from the slower 429 path.
+      // AbortError covers both our 10s timeout and OS-level connection drops.
+      const isTransient = err.name === "AbortError" ||
+        ["ECONNRESET", "ENOTFOUND", "ETIMEDOUT", "ECONNREFUSED"].includes(err.code);
+      if (isTransient && attempt < 3) {
+        const backoff = Math.round(250 * Math.pow(2, attempt) + Math.random() * 250);
+        log.warn(`REST ${method} ${path} network error — retry ${attempt + 1} in ${backoff}ms`);
+        await new Promise(r => setTimeout(r, backoff));
+        return this._request(method, path, body, attempt + 1);
+      }
       log.error(`REST ${method} ${path} failed`, { error: err.message });
       throw err;
     } finally {
@@ -273,9 +291,9 @@ export class PolymarketFeed {
         const raw = this._parseBook(msg, 0);
         book = {
           tokenId: assetId,
-          bestBid: raw.bestAsk > 0 ? parseFloat((1 - raw.bestAsk).toFixed(4)) : 0,
-          bestAsk: raw.bestBid > 0 ? parseFloat((1 - raw.bestBid).toFixed(4)) : 1,
-          mid: parseFloat((1 - raw.mid).toFixed(4)),
+          bestBid: raw.bestAsk > 0 ? Math.round((1 - raw.bestAsk) * 10000) / 10000 : 0,
+          bestAsk: raw.bestBid > 0 ? Math.round((1 - raw.bestBid) * 10000) / 10000 : 1,
+          mid: Math.round((1 - raw.mid) * 10000) / 10000,
           spread: raw.spread,
           bids: [],
           asks: [],
@@ -433,8 +451,197 @@ export class PolymarketFeed {
     }
   }
 
+  // ─── USER CHANNEL WEBSOCKET ─────────────────────────────────────────
+  connectUserWs() {
+    const url = CONFIG.poly.userWsUrl;
+    log.info(`Connecting user WS to ${url}`);
+
+    this.userWs = new WebSocket(url);
+
+    this.userWs.on("open", () => {
+      this.userWsConnected = true;
+      this.userWsReconnectDelay = 2000;
+      log.info("Connected to Polymarket user WebSocket");
+
+      // Authenticate
+      this.userWs.send(JSON.stringify({
+        auth: {
+          apiKey: CONFIG.poly.apiKey,
+          secret: CONFIG.poly.apiSecret,
+          passphrase: CONFIG.poly.apiPassphrase,
+        },
+        type: "user",
+      }));
+
+      // Re-subscribe to all known condition IDs (handles reconnects)
+      for (const conditionId of this._userSubscribedConditions) {
+        this.userWs.send(JSON.stringify({
+          type: "subscribe",
+          channel: "user",
+          markets: [conditionId],
+        }));
+      }
+      if (this._userSubscribedConditions.size > 0) {
+        log.info("User WS subscribed to conditions", { count: this._userSubscribedConditions.size });
+      }
+    });
+
+    this.userWs.on("message", (raw) => {
+      const text = raw.toString();
+      if (text[0] !== "{" && text[0] !== "[") return;
+      try {
+        const msg = JSON.parse(text);
+        this._processUserMessage(msg);
+      } catch (err) {
+        log.error("Failed to parse user WS message", { error: err.message });
+      }
+    });
+
+    this.userWs.on("error", (err) => {
+      log.error("User WS error", { error: err.message });
+      this.emit("error", err);
+    });
+
+    this.userWs.on("close", (code) => {
+      this.userWsConnected = false;
+      log.warn(`User WS disconnected (code=${code})`);
+      this._reconnectUserWs();
+    });
+  }
+
+  _processUserMessage(msg) {
+    const eventType = msg.event_type || msg.type;
+
+    // Trade events (fill notifications)
+    if (eventType === "trade" || eventType === "last_trade_price") {
+      const status = (msg.status ?? "").toUpperCase();
+      if (status === "MATCHED" || status === "CONFIRMED") {
+        // Match to orderId via taker_order_id or maker_orders
+        const orderIds = new Set();
+        if (msg.taker_order_id) orderIds.add(String(msg.taker_order_id));
+        if (Array.isArray(msg.maker_orders)) {
+          for (const mo of msg.maker_orders) {
+            if (mo.order_id) orderIds.add(String(mo.order_id));
+          }
+        }
+        if (msg.order_id) orderIds.add(String(msg.order_id));
+
+        const fillResult = {
+          status: "MATCHED",
+          avgPrice: msg.price != null ? parseFloat(msg.price) : null,
+          filledQty: msg.size != null ? parseFloat(msg.size) : null,
+        };
+
+        for (const orderId of orderIds) {
+          const pending = this._pendingFills.get(orderId);
+          if (pending) pending.resolve(fillResult);
+        }
+
+        this.emit("fill", { ...fillResult, orderIds: [...orderIds] });
+      }
+    }
+
+    // Order events (cancellation, status changes)
+    if (eventType === "order") {
+      const orderType = (msg.type ?? "").toUpperCase();
+      if (orderType === "CANCELLATION" || (msg.status ?? "").toUpperCase() === "CANCELLED") {
+        const orderId = msg.id != null ? String(msg.id) : msg.order_id != null ? String(msg.order_id) : null;
+        if (orderId) {
+          const filledQty = this._parseSizeMatched(msg);
+          const pending = this._pendingFills.get(orderId);
+          if (pending) {
+            pending.resolve({
+              status: "CANCELLED",
+              avgPrice: msg.price != null ? parseFloat(msg.price) : null,
+              filledQty,
+            });
+          }
+        }
+      }
+      this.emit("orderUpdate", msg);
+    }
+  }
+
+  _parseSizeMatched(msg) {
+    const matched = parseFloat(msg.size_matched ?? msg.sizeMatched ?? NaN);
+    if (isFinite(matched)) return matched;
+    const remaining = parseFloat(msg.remainingSize ?? msg.remaining ?? NaN);
+    const total = parseFloat(msg.original_size ?? msg.size ?? NaN);
+    if (isFinite(remaining) && isFinite(total)) return Math.max(0, total - remaining);
+    return 0;
+  }
+
+  _reconnectUserWs() {
+    log.info(`Reconnecting user WS in ${this.userWsReconnectDelay}ms...`);
+    setTimeout(() => {
+      this.userWsReconnectDelay = Math.min(this.userWsReconnectDelay * 2, this.maxReconnectDelay);
+      this.connectUserWs();
+    }, this.userWsReconnectDelay);
+  }
+
+  /**
+   * Wait for a fill event from the user WS for a given order.
+   * Returns null immediately if user WS is disconnected (caller should use REST fallback).
+   * Returns a Promise that resolves with fill result or TIMEOUT.
+   */
+  waitForFillEvent(orderId, timeoutMs) {
+    if (!this.userWsConnected) return null;
+    const key = String(orderId);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this._pendingFills.delete(key);
+        resolve({ status: "TIMEOUT", avgPrice: null, filledQty: 0 });
+      }, timeoutMs);
+      this._pendingFills.set(key, {
+        resolve: (result) => {
+          clearTimeout(timer);
+          this._pendingFills.delete(key);
+          resolve(result);
+        },
+      });
+    });
+  }
+
+  subscribeUser(conditionId) {
+    if (!conditionId) return;
+    this._userSubscribedConditions.add(conditionId);
+    if (this.userWs && this.userWsConnected) {
+      this.userWs.send(JSON.stringify({
+        type: "subscribe",
+        channel: "user",
+        markets: [conditionId],
+      }));
+    }
+  }
+
+  unsubscribeUser(conditionId) {
+    if (!conditionId) return;
+    this._userSubscribedConditions.delete(conditionId);
+    if (this.userWs && this.userWsConnected) {
+      this.userWs.send(JSON.stringify({
+        type: "unsubscribe",
+        channel: "user",
+        markets: [conditionId],
+      }));
+    }
+  }
+
   disconnect() {
     this.stopPolling(); // stops all
+
+    // Close user WS and resolve all pending fills
+    if (this.userWs) {
+      this.userWs.removeAllListeners();
+      this.userWs.close();
+      this.userWs = null;
+    }
+    this.userWsConnected = false;
+    for (const [, pending] of this._pendingFills) {
+      pending.resolve({ status: "TIMEOUT", avgPrice: null, filledQty: 0 });
+    }
+    this._pendingFills.clear();
+    this._userSubscribedConditions.clear();
+
     if (this.ws) {
       this.ws.removeAllListeners();
       this.ws.close();
@@ -450,6 +657,7 @@ export class PolymarketFeed {
 
     return {
       connected: this.connected,
+      userWsConnected: this.userWsConnected,
       messageCount: this.messageCount,
       lastUpdateAge: Date.now() - this.lastUpdateTime,
       avgRestLatency: Math.round(avgLatency),

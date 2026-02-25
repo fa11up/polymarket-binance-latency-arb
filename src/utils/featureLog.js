@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from "fs";
+import { appendFile, mkdirSync } from "fs";
 import { join } from "path";
 import { createLogger } from "./logger.js";
 
@@ -17,9 +17,7 @@ try { mkdirSync(DATA_DIR, { recursive: true }); } catch { /* ignore — dir alre
  * operator knows the dataset may have gaps.
  */
 export function logFeature(record) {
-  try {
-    appendFileSync(LOG_PATH, JSON.stringify({ ...record, _at: new Date().toISOString() }) + "\n");
-  } catch (err) {
-    log.warn("Feature log write failed", { error: err.message, outcome: record.outcome });
-  }
+  appendFile(LOG_PATH, JSON.stringify({ ...record, _at: new Date().toISOString() }) + "\n", (err) => {
+    if (err) log.warn("Feature log write failed", { error: err.message, outcome: record.outcome });
+  });
 }

@@ -69,14 +69,34 @@ function validMarketBody() {
 
 // ─── MarketDiscovery.fetchMarket ─────────────────────────────────────────────
 
-test("discovery.fetchMarket: returns null on network error", async () => {
+test("discovery.fetchMarket: returns null on network error after all retries exhausted", async () => {
+  // Error with no .code and no AbortError name → not transient → immediate null.
   const discovery = new MarketDiscovery("btc", 5);
   const result = await withFetch(
     async () => { throw new Error("ECONNREFUSED"); },
     () => discovery.fetchMarket(1700000000)
   );
-  assert.equal(result, null, "network error should return null (graceful fallback)");
+  assert.equal(result, null, "non-transient error should return null");
 });
+
+test("discovery.fetchMarket: retries on transient network error and succeeds on second attempt", async () => {
+  const discovery = new MarketDiscovery("btc", 5);
+  let callCount = 0;
+  const body = validMarketBody();
+  const networkErr = Object.assign(new Error("connection reset"), { code: "ECONNRESET" });
+
+  const result = await withFetch(
+    async () => {
+      callCount++;
+      if (callCount === 1) throw networkErr;
+      return { ok: true, json: async () => body };
+    },
+    () => discovery.fetchMarket(1700000000)
+  );
+
+  assert.ok(result !== null, "should succeed after retry");
+  assert.equal(callCount, 2, "fetch should be called twice (1 error + 1 success)");
+}, { timeout: 3_000 }); // 3s: backoff is ~250-500ms
 
 test("discovery.fetchMarket: returns null on HTTP 404", async () => {
   const discovery = new MarketDiscovery("btc", 5);
@@ -178,6 +198,41 @@ test("polymarket._request: throws when max retries exhausted (attempt=3 with 429
   );
 });
 
+test("polymarket._request: retries once on AbortError and succeeds on second attempt", async () => {
+  const poly = new PolymarketFeed();
+  let callCount = 0;
+  const payload = { id: "order-retry" };
+  const abortErr = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+
+  const result = await withFetch(
+    async () => {
+      callCount++;
+      if (callCount === 1) throw abortErr;
+      return { ok: true, json: async () => payload };
+    },
+    () => poly._request("GET", "/test")
+  );
+
+  assert.deepEqual(result, payload, "should succeed after network retry");
+  assert.equal(callCount, 2, "fetch should be called twice (1 abort + 1 success)");
+}, { timeout: 3_000 }); // 3s: backoff is ~250-500ms
+
+test("polymarket._request: throws when max network retries exhausted (attempt=3 with AbortError)", async () => {
+  const poly = new PolymarketFeed();
+  const abortErr = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
+
+  await withFetch(
+    async () => { throw abortErr; },
+    async () => {
+      await assert.rejects(
+        () => poly._request("GET", "/test", null, 3),
+        /This operation was aborted/,
+        "exhausted network retries should throw"
+      );
+    }
+  );
+});
+
 test("polymarket._request: retries once on 429 and succeeds on second attempt", async () => {
   // First call returns 429, second returns 200. The backoff timer (~1-1.5s) runs
   // in real time — this test is intentionally slightly slow (≈1s).
@@ -244,4 +299,93 @@ test("polymarket._parseBook: empty book returns sensible defaults", () => {
   assert.equal(book.bestBid, 0,   "empty bids → bestBid = 0");
   assert.equal(book.bestAsk, 1,   "empty asks → bestAsk = 1");
   assert.ok(Math.abs(book.mid - 0.5) < 0.001, "empty book → mid = 0.5");
+});
+
+// ─── PolymarketFeed — User WS fill promise system ──────────────────────────
+
+test("waitForFillEvent: returns null when userWs is disconnected", () => {
+  const poly = new PolymarketFeed();
+  assert.equal(poly.userWsConnected, false);
+  const result = poly.waitForFillEvent("some-order", 5000);
+  assert.equal(result, null, "should return null when user WS disconnected");
+});
+
+test("waitForFillEvent: times out when no event arrives", async () => {
+  const poly = new PolymarketFeed();
+  poly.userWsConnected = true;
+
+  const result = await poly.waitForFillEvent("timeout-order", 50);
+  assert.equal(result.status, "TIMEOUT");
+  assert.equal(result.filledQty, 0);
+  assert.equal(result.avgPrice, null);
+  assert.equal(poly._pendingFills.has("timeout-order"), false, "pending fill should be cleaned up");
+});
+
+test("_processUserMessage: resolves pending fill on MATCHED trade event", async () => {
+  const poly = new PolymarketFeed();
+  poly.userWsConnected = true;
+
+  const fillPromise = poly.waitForFillEvent("order-123", 5000);
+
+  // Simulate trade event arriving via WS
+  poly._processUserMessage({
+    event_type: "trade",
+    status: "MATCHED",
+    price: "0.62",
+    size: "8.5",
+    taker_order_id: "order-123",
+  });
+
+  const result = await fillPromise;
+  assert.equal(result.status, "MATCHED");
+  assert.equal(result.avgPrice, 0.62);
+  assert.equal(result.filledQty, 8.5);
+  assert.equal(poly._pendingFills.has("order-123"), false, "pending fill should be cleaned up");
+});
+
+test("_processUserMessage: resolves pending fill via maker_orders match", async () => {
+  const poly = new PolymarketFeed();
+  poly.userWsConnected = true;
+
+  const fillPromise = poly.waitForFillEvent("maker-order-456", 5000);
+
+  poly._processUserMessage({
+    event_type: "trade",
+    status: "CONFIRMED",
+    price: "0.55",
+    size: "12",
+    maker_orders: [{ order_id: "maker-order-456" }],
+  });
+
+  const result = await fillPromise;
+  assert.equal(result.status, "MATCHED");
+  assert.equal(result.avgPrice, 0.55);
+  assert.equal(result.filledQty, 12);
+});
+
+test("_processUserMessage: resolves pending fill on CANCELLATION order event", async () => {
+  const poly = new PolymarketFeed();
+  poly.userWsConnected = true;
+
+  const fillPromise = poly.waitForFillEvent("cancel-order-789", 5000);
+
+  poly._processUserMessage({
+    event_type: "order",
+    type: "CANCELLATION",
+    id: "cancel-order-789",
+    size_matched: "3",
+    price: "0.58",
+  });
+
+  const result = await fillPromise;
+  assert.equal(result.status, "CANCELLED");
+  assert.equal(result.filledQty, 3);
+});
+
+test("getStats: includes userWsConnected field", () => {
+  const poly = new PolymarketFeed();
+  const stats = poly.getStats();
+  assert.equal(stats.userWsConnected, false);
+  poly.userWsConnected = true;
+  assert.equal(poly.getStats().userWsConnected, true);
 });

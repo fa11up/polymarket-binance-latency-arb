@@ -1,6 +1,7 @@
 import { CONFIG } from "../config.js";
 import { createLogger } from "../utils/logger.js";
 import { sendAlert } from "../utils/alerts.js";
+import { polymarketFee } from "../utils/math.js";
 
 const log = createLogger("RISK");
 
@@ -21,6 +22,7 @@ export class RiskManager {
     this.lastTradeTime = 0;
     this.dailyPnl = 0;
     this.dailyTrades = 0;
+    this.dailyHighWatermark = CONFIG.risk.bankroll; // resets each day; locks in intraday profits
     this.dailyResetTime = this._nextMidnight();
     this.killed = false;
     this.killReason = null;
@@ -37,9 +39,11 @@ export class RiskManager {
       log.info("Daily reset", {
         previousPnl: this.dailyPnl.toFixed(2),
         previousTrades: this.dailyTrades,
+        highWatermark: this.dailyHighWatermark.toFixed(2),
       });
       this.dailyPnl = 0;
       this.dailyTrades = 0;
+      this.dailyHighWatermark = this.bankroll;
       this.dailyResetTime = this._nextMidnight();
     }
   }
@@ -72,9 +76,10 @@ export class RiskManager {
       reasons.push(`Bankroll depleted: $${this.bankroll.toFixed(2)}`);
     }
 
-    // Daily loss limit
-    if (this.dailyPnl <= -CONFIG.risk.dailyLossLimit) {
-      reasons.push(`Daily loss limit hit: $${this.dailyPnl.toFixed(2)}`);
+    // Daily loss limit: block if bankroll has fallen more than dailyLossLimit below today's peak.
+    // This locks in intraday profits — you can never lose more than the limit from the day's high.
+    if (this.bankroll <= this.dailyHighWatermark - CONFIG.risk.dailyLossLimit) {
+      reasons.push(`Daily loss limit hit: bankroll $${this.bankroll.toFixed(2)} is $${(this.dailyHighWatermark - this.bankroll).toFixed(2)} below today's high ($${this.dailyHighWatermark.toFixed(2)})`);
     }
 
     // Max drawdown
@@ -86,8 +91,10 @@ export class RiskManager {
       sendAlert(`🛑 KILL SWITCH: ${this.killReason}`, "error");
     }
 
-    // Edge too thin (slippage + fees would eat it)
-    const minViableEdge = (CONFIG.risk.slippageBps + CONFIG.risk.feeBps) / 10000;
+    // Edge too thin (slippage + dynamic Polymarket fee would eat it).
+    // Fee peaks at 1.56% at p=0.5 and falls toward extremes — computed per-signal.
+    const feeFrac = signal ? polymarketFee(signal.entryPrice) : 0;
+    const minViableEdge = CONFIG.risk.slippageBps / 10000 + feeFrac;
     if (signal && signal.edge < minViableEdge) {
       reasons.push(`Edge ${(signal.edge * 100).toFixed(1)}% < cost ${(minViableEdge * 100).toFixed(1)}%`);
     }
@@ -156,6 +163,7 @@ export class RiskManager {
     this.bankroll += pos.size + pnl; // return capital + pnl
     this.dailyPnl += pnl;
     this.peakBankroll = Math.max(this.peakBankroll, this.bankroll);
+    this.dailyHighWatermark = Math.max(this.dailyHighWatermark, this.bankroll);
 
     const holdTime = Date.now() - pos.openTime;
     log.trade(`Position closed: ${tradeId}`, {
@@ -188,6 +196,7 @@ export class RiskManager {
     this.bankroll += realizedNotional + realizedPnl;
     this.dailyPnl += realizedPnl;
     this.peakBankroll = Math.max(this.peakBankroll, this.bankroll);
+    this.dailyHighWatermark = Math.max(this.dailyHighWatermark, this.bankroll);
 
     log.trade(`Partial close: ${tradeId}`, {
       realizedNotional: realizedNotional.toFixed(2),
@@ -204,7 +213,7 @@ export class RiskManager {
    * Open positions are restored here so closePosition() can find them by ID
    * when the executor's monitors eventually exit them.
    */
-  restoreState({ bankroll, dailyPnl, dailyTrades, dailyResetTime, openPositions } = {}) {
+  restoreState({ bankroll, dailyPnl, dailyTrades, dailyResetTime, dailyHighWatermark, openPositions } = {}) {
     if (bankroll != null) this.bankroll = bankroll;
     // peakBankroll is intentionally NOT restored. The kill switch is per-session:
     // each restart begins with a fresh 25% drawdown buffer from the current bankroll.
@@ -214,6 +223,11 @@ export class RiskManager {
     if (dailyPnl != null) this.dailyPnl = dailyPnl;
     if (dailyTrades != null) this.dailyTrades = dailyTrades;
     if (dailyResetTime != null) this.dailyResetTime = dailyResetTime;
+    // Restore daily high watermark so the loss limit is relative to today's actual peak,
+    // not just the bankroll at startup time.
+    this.dailyHighWatermark = dailyHighWatermark != null
+      ? Math.max(dailyHighWatermark, this.bankroll)
+      : this.bankroll;
 
     for (const pos of (openPositions || [])) {
       this.openPositions.set(pos.id, pos);
@@ -259,6 +273,8 @@ export class RiskManager {
       openPositions: this.openPositions.size,
       dailyPnl: this.dailyPnl,
       dailyTrades: this.dailyTrades,
+      dailyHighWatermark: this.dailyHighWatermark,
+      dailyDrawdown: this.dailyHighWatermark - this.bankroll,
       killed: this.killed,
       killReason: this.killReason,
       positions: Array.from(this.openPositions.values()).map(p => ({

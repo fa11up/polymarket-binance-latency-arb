@@ -39,7 +39,7 @@ export class MarketDiscovery {
    * Fetch a market from Gamma API by its aligned timestamp.
    * Returns normalized market object or null if not found / not tradeable.
    */
-  async fetchMarket(alignedTs) {
+  async fetchMarket(alignedTs, attempt = 0) {
     const slug = this._buildSlug(alignedTs);
     const url = `${CONFIG.poly.gammaApiUrl}/markets/slug/${slug}`;
 
@@ -90,6 +90,17 @@ export class MarketDiscovery {
 
       return market;
     } catch (err) {
+      // Retry on transient network errors — distinct from "market not found" (HTTP non-ok)
+      // which returns null immediately above. A network drop during rotation must not
+      // silently stall the engine on the expired contract.
+      const isTransient = err.name === "AbortError" ||
+        ["ECONNRESET", "ENOTFOUND", "ETIMEDOUT", "ECONNREFUSED"].includes(err.code);
+      if (isTransient && attempt < 3) {
+        const backoff = Math.round(250 * Math.pow(2, attempt) + Math.random() * 250);
+        log.warn(`Failed to fetch market ${slug} — retry ${attempt + 1} in ${backoff}ms`, { error: err.message });
+        await new Promise(r => setTimeout(r, backoff));
+        return this.fetchMarket(alignedTs, attempt + 1);
+      }
       log.error(`Failed to fetch market ${slug}`, { error: err.message });
       return null;
     } finally {
@@ -168,13 +179,18 @@ export class MarketDiscovery {
           // Retry after a short delay — market may not be created yet
           log.warn("Next market not available yet, retrying in 10s...");
           this._rotationTimer = setTimeout(async () => {
-            const retryMarket = await this.findCurrentMarket();
-            if (retryMarket) {
-              await onNewMarket(retryMarket);
-              this._scheduleNext(onNewMarket);
-            } else {
-              log.error("Failed to find next market after retry");
-              this._scheduleNext(onNewMarket);
+            try {
+              const retryMarket = await this.findCurrentMarket();
+              if (retryMarket) {
+                await onNewMarket(retryMarket);
+                this._scheduleNext(onNewMarket);
+              } else {
+                log.error("Failed to find next market after retry");
+                this._scheduleNext(onNewMarket);
+              }
+            } catch (err) {
+              log.error("Rotation retry failed", { error: err.message });
+              this._rotationTimer = setTimeout(() => this._scheduleNext(onNewMarket), 15000);
             }
           }, 10000);
         }

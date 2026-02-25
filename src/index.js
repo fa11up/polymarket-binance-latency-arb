@@ -11,7 +11,7 @@ import { CalibrationTable } from "./engine/calibration.js";
 import { createLogger, setLogSink } from "./utils/logger.js";
 import { sendAlert } from "./utils/alerts.js";
 import { TUI } from "./utils/tui.js";
-import { saveState, loadState } from "./utils/stateStore.js";
+import { saveState, loadState, flushStateWrites } from "./utils/stateStore.js";
 import { fetchPriceAtTimestamp } from "./utils/chainlink.js";
 
 const log = createLogger("MAIN");
@@ -131,6 +131,8 @@ class ArbEngine {
       if (book.tokenId) {
         const m = this.tokenToMarket.get(book.tokenId);
         if (m) m.strategy.onContractUpdate(book);
+        // Route book events to executor for event-driven position monitoring
+        this.executor.onBookUpdate(book.tokenId, book);
       }
     });
 
@@ -175,7 +177,11 @@ class ArbEngine {
           }
           return;
         }
-        await this.executor.execute(signal);
+        try {
+          await this.executor.execute(signal);
+        } catch (err) {
+          log.error(`[${signal.label}] Unexpected execution error`, { error: err.message });
+        }
       });
     }
 
@@ -206,6 +212,11 @@ class ArbEngine {
 
     log.info("Connecting Polymarket CLOB feed...");
     this.polymarket.connectWs();
+
+    // Connect user channel WS for event-driven fill detection (live mode only)
+    if (!CONFIG.execution.dryRun) {
+      this.polymarket.connectUserWs();
+    }
 
     // Start REST polling as baseline for each market's YES token
     // (WS can connect but deliver no book data; REST guarantees fresh snapshots)
@@ -288,6 +299,23 @@ class ArbEngine {
     if (timer.unref) timer.unref();
   }
 
+  /**
+   * Refresh realized vol from Binance 1m klines and re-seed the strategy.
+   * Fire-and-forget — does not block the rotation critical path.
+   * Updates both the strategy's volEma (warm-start) and _baseVol (cold-start fallback).
+   * The feed's absDeltaEma is left untouched — it runs continuously across windows.
+   */
+  _refreshVol(m) {
+    m.binance.fetchRecentVol().then(vol => {
+      if (vol != null) {
+        m.strategy.seedVol(vol);
+        log.info(`[${m.asset}/${m.windowMins}m] Vol refreshed`, { vol: `${(vol * 100).toFixed(2)}%` });
+      }
+    }).catch(err => {
+      log.warn(`[${m.asset}/${m.windowMins}m] Vol refresh failed — retaining previous`, { error: err.message });
+    });
+  }
+
   /** Discover the current market for one (asset, window) pair and start rotation. */
   async _initMarket(m) {
     const label = `${m.asset}/${m.windowMins}m`;
@@ -306,6 +334,7 @@ class ArbEngine {
 
       // Subscribe to this market's tokens on Polymarket WS
       this.polymarket.addSubscription(m.activeMarket.tokenIdYes, m.activeMarket.tokenIdNo);
+      this.polymarket.subscribeUser(m.activeMarket.conditionId);
 
       // Start rotation timer
       m.discovery.startRotation(async (newMarket) => {
@@ -318,6 +347,7 @@ class ArbEngine {
         m._seenBlockReasons.clear();
 
         // Unsubscribe old tokens
+        this.polymarket.unsubscribeUser(m.activeMarket.conditionId);
         this.polymarket.removeSubscription(m.activeMarket.tokenIdYes, m.activeMarket.tokenIdNo);
         this.polymarket.stopPolling(m.activeMarket.tokenIdYes);
         this._unregisterMarketTokens(m.activeMarket);
@@ -327,7 +357,9 @@ class ArbEngine {
         this._registerMarketTokens(m, newMarket);
         m.strategy.setMarket(newMarket);
         this._seedChainlinkStrike(m, newMarket);
+        this._refreshVol(m);            // fire-and-forget: updates _baseVol + volEma seed
         this.polymarket.addSubscription(newMarket.tokenIdYes, newMarket.tokenIdNo);
+        this.polymarket.subscribeUser(newMarket.conditionId);
         this.polymarket.startPolling(newMarket.tokenIdYes, 1000);
 
         await sendAlert(`🔄 [${label}] Rotated: ${newMarket.slug}`, "info");
@@ -350,9 +382,14 @@ class ArbEngine {
 
   /**
    * Load calibration table from historical feature + trade NDJSON files.
-   * Returns null if insufficient data or files don't exist.
+   * Returns null if disabled, insufficient data, or files don't exist.
    */
   _loadCalibration() {
+    if (!CONFIG.execution.calibrationEnabled) {
+      log.info("Calibration: disabled (CALIBRATION_ENABLED=false) — using raw model probabilities");
+      return null;
+    }
+
     try {
       const dataDir = join(process.cwd(), "data");
       const featuresRaw = readFileSync(join(dataDir, "features.ndjson"), "utf8");
@@ -392,6 +429,7 @@ class ArbEngine {
     if (this.statusInterval) clearInterval(this.statusInterval);
     if (this.saveInterval) clearInterval(this.saveInterval);
     this._saveState(); // final save before exit
+    await flushStateWrites(5000);
 
     // Restore terminal before printing final summary
     if (this.tui) this.tui.destroy();
@@ -417,6 +455,7 @@ class ArbEngine {
         dailyPnl: this.risk.dailyPnl,
         dailyTrades: this.risk.dailyTrades,
         dailyResetTime: this.risk.dailyResetTime,
+        dailyHighWatermark: this.risk.dailyHighWatermark,
         openPositions: Array.from(this.risk.openPositions.values()),
       },
       openPositions: this.executor.getOpenSnapshot(),

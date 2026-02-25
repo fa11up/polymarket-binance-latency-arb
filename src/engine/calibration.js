@@ -1,20 +1,23 @@
-import { createLogger } from "../utils/logger.js";
-
-const log = createLogger("CALIBRATION");
-
 const NUM_BINS = 10;
 
 /**
  * Binned calibration table for adjusting raw model probabilities
- * based on observed win rates.
+ * based on observed P(YES) outcomes.
  *
  * Divides the [0, 1] probability range into NUM_BINS equal bins.
- * For each bin, tracks the observed win rate from historical trade outcomes.
+ * For each bin, tracks the observed P(YES) rate — the fraction of trades in
+ * that bin where YES actually happened, regardless of trade direction.
+ *
+ *   BUY_YES win  → YES happened    → P(YES observed) = 1
+ *   BUY_YES loss → YES didn't      → P(YES observed) = 0
+ *   BUY_NO  win  → YES didn't      → P(YES observed) = 0
+ *   BUY_NO  loss → YES happened    → P(YES observed) = 1
+ *
+ * This keeps the table direction-agnostic: every bin tracks a consistent
+ * quantity (P(YES)) that can be directly compared to the raw modelProb.
+ *
  * Applies a conservative blend: adjusted = raw * (1 - w) + calibrated * w
  * where w = min(observations_in_bin / 50, 0.5).
- *
- * This corrects systematic bias in the BS N(d2) model without requiring
- * a large dataset — the blend weight prevents overcorrection when data is sparse.
  */
 export class CalibrationTable {
   constructor() {
@@ -35,12 +38,15 @@ export class CalibrationTable {
    * Record a trade outcome into the calibration table.
    * @param {number} modelProb - The model probability at time of signal
    * @param {boolean} won - Whether the trade was profitable
+   * @param {string} direction - "BUY_YES" or "BUY_NO"
    */
-  record(modelProb, won) {
+  record(modelProb, won, direction = "BUY_YES") {
     const idx = this._binIndex(modelProb);
     const bin = this.bins[idx];
     bin.total++;
-    if (won) bin.wins++;
+    // Track P(YES observed): for BUY_NO, winning means YES did NOT happen.
+    const yesObserved = direction === "BUY_NO" ? !won : won;
+    if (yesObserved) bin.wins++;
     bin.observedRate = bin.total > 0 ? bin.wins / bin.total : null;
   }
 
@@ -102,7 +108,7 @@ export class CalibrationTable {
       }
 
       if (trade && trade.pnl != null) {
-        table.record(f.modelProb, trade.pnl > 0);
+        table.record(f.modelProb, trade.pnl > 0, f.edgeDirection);
       }
     }
 

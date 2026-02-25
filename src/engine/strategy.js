@@ -92,6 +92,10 @@ export class Strategy {
     // Calibration table — injected by ArbEngine on startup if historical data exists.
     // When present, modelProb is adjusted before edge calculation.
     this.calibration = null;
+
+    // Cache the per-asset vol config value so _evaluate() and _dynamicThreshold()
+    // don't walk the frozen CONFIG object on every 100ms Binance tick.
+    this._baseVol = CONFIG.strategy.volMap[this.asset] ?? CONFIG.strategy.volMap.BTC;
   }
 
   /**
@@ -144,12 +148,14 @@ export class Strategy {
   }
 
   /**
-   * Pre-seed the vol EMA with a known daily vol so signals computed in the
-   * first few seconds after startup use a calibrated value rather than zero.
-   * Called by ArbEngine after fetching Binance klines vol at startup.
+   * Seed the vol EMA and the cold-start fallback with a known daily vol.
+   * Called by ArbEngine at startup and on each rotation when klines are available.
+   * Both must be updated together: the EMA provides intra-window dynamics once warm
+   * (~20 ticks), and _baseVol covers the cold-start period immediately after rotation.
    */
   seedVol(vol) {
     this.volEma.value = vol;
+    this._baseVol = vol;
   }
 
   /** Inject a live bankroll getter so position sizing uses current capital. */
@@ -233,7 +239,7 @@ export class Strategy {
       spread,
       contractBidDepth: this.contractBidDepth,
       contractAskDepth: this.contractAskDepth,
-      vol: this.volEma.value || CONFIG.strategy.volMap[this.asset],
+      vol: this.volEma.value || this._baseVol,
       hoursToExpiry: this._estimateHoursToExpiry(),
       feedLag,
       spotDelta: this.spotDelta,
@@ -250,7 +256,7 @@ export class Strategy {
   _dynamicThreshold() {
     const base = this.windowMins >= 15
       ? CONFIG.strategy.entryThresholdLong
-      : CONFIG.strategy.entryThreshold;
+      : (CONFIG.strategy.entryThresholdMap5m[this.asset] ?? CONFIG.strategy.entryThreshold);
     let adj = 0;
 
     // Wide spread: if spread > 4c, add half the excess to threshold
@@ -262,8 +268,14 @@ export class Strategy {
     if (minDepth < 20) adj += 0.02;
 
     // Elevated vol: if realized vol > 2x base vol, add 1% to threshold
-    const baseVol = CONFIG.strategy.volMap[this.asset];
-    if ((this.volEma.value || baseVol) > baseVol * 2) adj += 0.01;
+    if ((this.volEma.value || this._baseVol) > this._baseVol * 2) adj += 0.01;
+
+    // Near-50¢ penalty: contracts away from 50¢ have directional momentum baked in.
+    // SL rate doubles once |mid - 0.5| > 0.05 (51% vs 25% for near-50¢ entries).
+    const distFromMid = Math.abs((this.contractMid || 0.5) - 0.5);
+    if (distFromMid > 0.15)      adj += 0.03;
+    else if (distFromMid > 0.10) adj += 0.02;
+    else if (distFromMid > 0.05) adj += 0.01;
 
     return base + adj;
   }
@@ -292,8 +304,7 @@ export class Strategy {
     const threshold = this._dynamicThreshold();
     const strikePrice = this.marketOpenStrike;
 
-    const dailyVol = CONFIG.strategy.volMap[this.asset];
-    const vol = this.volEma.value || dailyVol;
+    const vol = this.volEma.value || this._baseVol;
     const hoursToExpiry = this._estimateHoursToExpiry();
 
     if (hoursToExpiry <= 0) return; // expired
@@ -338,31 +349,51 @@ export class Strategy {
 
     const edgeConfirmed = smoothedEdge >= threshold && edge.absolute >= threshold && executableEdge >= threshold;
 
-    const featureExtra = {
-      modelProb, threshold,
-      edgeAbsolute: edge.absolute, edgeDirection: edge.direction,
-      smoothedEdge, executableEdge,
-    };
-
     if (edgeConfirmed && isStale && this._onSignal) {
-      this._logFeature({ ...featureExtra, outcome: "fired" });
-      this._fireSignal({ edge, modelProb, smoothedEdge, feedLag, vol, hoursToExpiry });
+      // BUY_NO price gate: suppress when YES contract mid exceeds config threshold.
+      // All top-10 losses were BUY_NO at YES mid > 0.73 — model underestimates resolution
+      // risk at extremes and the stop-loss is asymmetrically large.
+      if (edge.direction === "BUY_NO" && this.contractMid > CONFIG.strategy.buyNoMaxYesMid) {
+        this._logFeature({
+          modelProb, threshold,
+          edgeAbsolute: edge.absolute, edgeDirection: edge.direction,
+          smoothedEdge, executableEdge,
+          outcome: "suppressed_buyno_price",
+        });
+        return;
+      }
+
+      // Compute sizing here so kelly can be included in the feature log.
+      const sizing = calculatePositionSize(this._liveBankroll(), edge, this.contractMid, CONFIG.risk);
+      if (!sizing) return;
+
+      const buyNoMult = edge.direction === "BUY_NO" ? CONFIG.strategy.buyNoKellyMult : 1.0;
+
+      this._logFeature({
+        modelProb, threshold,
+        edgeAbsolute: edge.absolute, edgeDirection: edge.direction,
+        smoothedEdge, executableEdge,
+        outcome: "fired",
+        kelly: sizing.kelly * buyNoMult,
+      });
+      this._fireSignal({ edge, modelProb, smoothedEdge, feedLag, vol, hoursToExpiry, sizing, buyNoMult });
     } else {
       const reason = !isStale ? "suppressed_not_stale" : "suppressed_edge";
-      this._logFeature({ ...featureExtra, outcome: reason });
+      // _logFeature throttles to 1 write/sec — defer object construction until inside.
+      if (Date.now() - this._lastFeatureLogMs >= 1000) {
+        this._logFeature({
+          modelProb, threshold,
+          edgeAbsolute: edge.absolute, edgeDirection: edge.direction,
+          smoothedEdge, executableEdge,
+          outcome: reason,
+        });
+      }
     }
   }
 
-  _fireSignal({ edge, modelProb, smoothedEdge, feedLag, vol, hoursToExpiry }) {
+  // sizing and buyNoMult are pre-computed in _evaluate() so kelly is available for feature logging.
+  _fireSignal({ edge, modelProb, smoothedEdge, feedLag, vol, hoursToExpiry, sizing, buyNoMult }) {
     if (!this._onSignal) return;
-
-    const sizing = calculatePositionSize(
-      this._liveBankroll(),
-      edge,
-      this.contractMid,
-      CONFIG.risk
-    );
-    if (!sizing) return;
 
     const tokenId = edge.direction === "BUY_YES" ? this.tokenIdYes : this.tokenIdNo;
     const entryPrice = edge.direction === "BUY_YES"
@@ -388,8 +419,8 @@ export class Strategy {
       direction: edge.direction,
       tokenId,
       entryPrice,
-      size: sizing.netSize,
-      rawSize: sizing.rawSize,
+      size: sizing.netSize * buyNoMult,
+      rawSize: sizing.rawSize * buyNoMult,
       edge: edge.absolute,
       smoothedEdge,
       modelProb,
@@ -398,7 +429,7 @@ export class Strategy {
       strikePrice: this.marketOpenStrike,
       feedLag,
       vol,
-      kelly: sizing.kelly,
+      kelly: sizing.kelly * buyNoMult,
       odds: sizing.odds,
       slippage: sizing.slippage,
       fee: sizing.fee,
@@ -435,9 +466,8 @@ export class Strategy {
 
   // ─── STATUS ─────────────────────────────────────────────────────────
   getStatus() {
-    const dailyVol = CONFIG.strategy.volMap[this.asset]
     const strikePrice = this.marketOpenStrike; // null until window opens
-    const vol = this.volEma.value || dailyVol;
+    const vol = this.volEma.value || this._baseVol;
     const hoursToExpiry = this._estimateHoursToExpiry();
     const modelProb = this.spotPrice && strikePrice
       ? impliedProbability(this.spotPrice, strikePrice, vol, hoursToExpiry)

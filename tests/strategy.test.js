@@ -5,10 +5,10 @@
  * but invisible in dry-run audits (suppressed signals are never logged as trades).
  *
  * Scenario baseline:
- *   BTC_VOL=0.5 (50% daily, wide distribution) with spot=95000, strike=50000
- *   gives modelProb ≈ 0.849 via N(d2≈1.034) — below MODEL_SATURATION_THRESHOLD (0.90).
- *   contractMid=0.73 → edge vs mid ≈ 0.119 ≥ threshold (0.08).
- *   contractBestAsk=0.74 → executableEdge ≈ 0.109 ≥ threshold.
+ *   BTC_VOL=0.5 (50% daily, wide distribution) with spot=80000, strike=50000, T=24h
+ *   gives modelProb ≈ 0.835 via N(d2≈0.690) — below MODEL_SATURATION_THRESHOLD (0.90).
+ *   contractMid=0.50 → edge vs mid ≈ 0.335, no near-50¢ distance penalty, threshold=0.08.
+ *   contractBestAsk=0.51 → executableEdge ≈ 0.325 ≥ threshold.
  *   feedLag=2s (isStale=true, below STALE_CONTRACT_MAX_MS=5s).
  *
  * Run: node --test tests/strategy.test.js
@@ -61,8 +61,8 @@ const NOW = Date.now();
  * With BTC_VOL=0.5 (50% daily) and spot=80000, strike=50000, T=24h:
  *   d2 = (ln(1.6) - 0.125) / 0.5 = 0.690
  *   modelProb = normalCdf(0.690) ≈ 0.835 < MODEL_SATURATION_THRESHOLD (0.90)
- *   edge vs mid (0.73) ≈ 0.105 ≥ threshold (0.08)
- *   executableEdge vs bestAsk (0.74) ≈ 0.095 ≥ threshold (0.08)
+ *   contractMid=0.50 → edge vs mid ≈ 0.335 ≥ threshold (0.08), distFromMid=0 (no penalty)
+ *   executableEdge vs bestAsk (0.51) ≈ 0.325 ≥ threshold (0.08)
  */
 function makeStrategy(overrides = {}) {
   const s = new Strategy("BTC", 5);
@@ -78,12 +78,13 @@ function makeStrategy(overrides = {}) {
   s.tokenIdYes = "token-yes-abc";
   s.tokenIdNo  = "token-no-abc";
 
-  // spot=80000 gives modelProb ≈ 0.835 — well below saturation threshold (0.90)
-  // but high enough to produce ≥8% edge against contractMid=0.73.
+  // spot=80000 gives modelProb ≈ 0.835 — well below saturation threshold (0.90).
+  // contractMid=0.50: near-50¢ distance penalty = 0, keeping baseline threshold at
+  // ENTRY_THRESHOLD (0.08) so individual adjustment tests can assert exact deltas.
   s.spotPrice       = 80_000;
-  s.contractMid     = 0.73;   // edge vs mid ≈ 0.105 ≥ threshold (0.08)
-  s.contractBestBid = 0.72;
-  s.contractBestAsk = 0.74;   // executableEdge ≈ 0.835 - 0.74 ≈ 0.095 ≥ threshold
+  s.contractMid     = 0.50;   // edge vs mid ≈ 0.335, no distance-from-50¢ penalty
+  s.contractBestBid = 0.49;
+  s.contractBestAsk = 0.51;   // executableEdge ≈ 0.835 - 0.51 ≈ 0.325 ≥ threshold
   s.contractBidDepth = 500;
   s.contractAskDepth = 500;
 
@@ -174,7 +175,7 @@ test("strategy: signal suppressed when entryPrice ≥ 1 (bestAsk at ceiling)", (
 // suppressed — otherwise we'd pay more than our model expects and the trade
 // has negative expected value after the spread.
 //
-// Scenario: mid=0.73, modelProb≈0.835 → edge vs mid ≈ 0.105 (≥ 0.08 ✓)
+// Scenario: mid=0.50, modelProb≈0.835 → edge vs mid ≈ 0.335 (≥ 0.08 ✓)
 //           bestAsk=0.84 → executableEdge = 0.835 - 0.84 ≈ -0.005 (< 0.08 ✗)
 //
 // Fix: _evaluate adds executableEdge >= threshold to edgeConfirmed.

@@ -52,9 +52,19 @@ export function calculateEdge(modelProb, contractPrice) {
   };
 }
 
+// ─── Polymarket dynamic taker fee ──────────────────────────────────────────
+// Applies to all crypto prediction markets (5m since Feb 12 2026, 15m since Jan 19 2026).
+// Formula: feeRate × (p × (1−p))^exponent, with feeRate=0.25 and exponent=2.
+// Returns fee as a fraction of notional. Peaks at 1.5625% at p=0.50,
+// falls to ~0.20% at the extremes (p=0.10 / p=0.90).
+export function polymarketFee(price) {
+  const p = Math.max(0.01, Math.min(0.99, price));
+  return 0.25 * Math.pow(p * (1 - p), 2);
+}
+
 // ─── Position sizing with slippage & fee adjustment ────────────────────────
 export function calculatePositionSize(bankroll, edge, contractPrice, config) {
-  const { maxBetFraction, maxPositionUsd, slippageBps, feeBps } = config;
+  const { maxBetFraction, maxPositionUsd, slippageBps } = config;
 
   const direction = edge.direction;
   const entryPrice = direction === "BUY_YES" ? contractPrice : 1 - contractPrice;
@@ -69,17 +79,18 @@ export function calculatePositionSize(bankroll, edge, contractPrice, config) {
 
   const rawSize = bankroll * kelly;
   const slippage = rawSize * slippageBps / 10000;
-  const fee = rawSize * feeBps / 10000;
+  const feeFrac = polymarketFee(entryPrice);
+  const fee = rawSize * feeFrac;
   const netSize = rawSize - slippage - fee;
 
   if (netSize <= 0 || netSize > maxPositionUsd) {
     return netSize <= 0 ? null : {
       rawSize: maxPositionUsd,
-      netSize: maxPositionUsd - (maxPositionUsd * (slippageBps + feeBps) / 10000),
+      netSize: maxPositionUsd - maxPositionUsd * (slippageBps / 10000 + feeFrac),
       kelly,
       odds,
       slippage: maxPositionUsd * slippageBps / 10000,
-      fee: maxPositionUsd * feeBps / 10000,
+      fee: maxPositionUsd * feeFrac,
       entryPrice,
       direction,
     };

@@ -79,6 +79,11 @@ function makePoly(overrides = {}) {
       bidDepth: 500, askDepth: 500,
       timestamp: Date.now(), lag: 0,
     }),
+    // User WS defaults: disconnected → REST fallback path for all existing tests
+    userWsConnected: false,
+    waitForFillEvent: () => null,
+    subscribeUser: () => {},
+    unsubscribeUser: () => {},
     ...overrides,
   };
 }
@@ -419,20 +424,20 @@ test("_monitorPosition race: no double-close when safety timeout overlaps in-fli
 
   exec._monitorPosition(trade);
 
-  // 2s: interval fires -> _exitPosition enters CLOSING and waits on _waitForFill.
-  t.mock.timers.tick(2_000);
+  // 0.5s: safety poll fires -> _exitPosition enters CLOSING and waits on _waitForFill.
+  t.mock.timers.tick(500);
   await Promise.resolve();
   assert.equal(trade.status, "CLOSING", "trade should be in-flight closing after monitor trigger");
 
   // 305s total: safety timeout fires while first close still in-flight (waiting for 400s).
-  t.mock.timers.tick(303_000);
+  t.mock.timers.tick(304_500);
   await Promise.resolve();
 
-  // 405s total: in-flight close resolves (wait started at t=2s, waits 400s).
+  // 405s total: in-flight close resolves (wait started at t=0.5s, waits 400s).
   t.mock.timers.tick(100_000);
   await Promise.resolve();
 
-  assert.equal(closeAttempts, 2, "race should produce exactly 2 close attempts: monitor + safety timeout");
+  assert.ok(closeAttempts >= 2, "race should produce multiple close attempts: safety polls + safety timeout");
   assert.equal(closeCommitted, 1, "only one close should commit");
   assert.equal(exec.tradeHistory.length, 1, "exactly one close event must be recorded");
   assert.equal(exec.pnlStats.n, 1, "P&L stats should only be updated once");
@@ -508,12 +513,13 @@ test("cancelAllOrders: null currentMid falls back to entryPrice — zero estimat
 // ─── Test 14: canTrade — daily loss limit ─────────────────────────────────────
 test("canTrade: daily loss limit blocks new trades", () => {
   const risk = makeRisk();
-  // Inject a loss that exceeds the configured DAILY_LOSS_LIMIT (500 in test env).
-  risk.dailyPnl = -501;
+  // Simulate: bankroll peaked at 1500 today, then dropped by 501 (beyond the 500 limit).
+  risk.dailyHighWatermark = 1500;
+  risk.bankroll = 999; // 1500 - 999 = 501 > 500 limit
 
   const { allowed, reasons } = risk.canTrade(makeSignal());
 
-  assert.equal(allowed, false, "trade should be blocked when daily loss limit is hit");
+  assert.equal(allowed, false, "trade should be blocked when bankroll falls > dailyLossLimit below today's peak");
   assert.ok(reasons.some(r => r.includes("Daily loss limit")),
     `expected 'Daily loss limit' in reasons, got: ${reasons}`);
 });
@@ -565,20 +571,20 @@ test("_monitorPosition race (real _exitPosition): monitor + safety overlap still
 
   exec._monitorPosition(trade);
 
-  // t=2s: monitor interval triggers first close attempt.
-  t.mock.timers.tick(2_000);
+  // t=0.5s: safety poll triggers first close attempt.
+  t.mock.timers.tick(500);
   await flush();
   assert.equal(trade.status, "CLOSING");
 
-  // t=305s: safety timeout overlaps; second close attempt should return false.
-  t.mock.timers.tick(303_000);
+  // t=305s: safety timeout overlaps; subsequent close attempts should return false.
+  t.mock.timers.tick(304_500);
   await flush();
 
-  // First in-flight close resolves at t=402s (wait started at t=2s, waits 400s).
+  // First in-flight close resolves at t=400.5s (wait started at t=0.5s, waits 400s).
   t.mock.timers.tick(100_000);
   await flush(12);
 
-  assert.equal(exitCalls, 2, "expected monitor close attempt + safety overlap attempt");
+  assert.ok(exitCalls >= 2, "expected multiple close attempts: safety polls + safety timeout");
   assert.equal(exec.tradeHistory.length, 1, "exactly one close should be recorded");
   assert.equal(exec.pnlStats.n, 1, "pnl stats must be pushed once");
   assert.ok(!exec.openOrders.has(trade.id));
@@ -971,7 +977,237 @@ test("_selectOrderStrategy: near expiry returns take even with wide spread", () 
   assert.equal(result.type, "take");
 });
 
-// ─── Test 36: execute with maker strategy falls through to take after reprices ─
+// ─── Test 36: _waitForFill WS event path — no REST calls when WS resolves MATCHED ─
+test("_waitForFill: WS event path resolves MATCHED without REST getOrder calls", async () => {
+  let getOrderCalled = false;
+  const poly = makePoly({
+    userWsConnected: true,
+    waitForFillEvent: () => Promise.resolve({
+      status: "MATCHED",
+      avgPrice: 0.58,
+      filledQty: 10,
+    }),
+    getOrder: async () => { getOrderCalled = true; return {}; },
+  });
+  const exec = new Executor(poly, makeRisk());
+
+  const fill = await exec._waitForFill("ord-ws", 10, 5000);
+
+  assert.equal(fill.status, "MATCHED");
+  assert.equal(fill.avgPrice, 0.58);
+  assert.equal(fill.filledQty, 10);
+  assert.equal(getOrderCalled, false, "should not call getOrder when WS resolves MATCHED");
+});
+
+// ─── Test 37: _waitForFill WS TIMEOUT falls through to final REST check ────
+test("_waitForFill: WS TIMEOUT triggers one final REST getOrder check", async () => {
+  let getOrderCalls = 0;
+  const poly = makePoly({
+    userWsConnected: true,
+    waitForFillEvent: () => Promise.resolve({
+      status: "TIMEOUT",
+      avgPrice: null,
+      filledQty: 0,
+    }),
+    getOrder: async () => {
+      getOrderCalls++;
+      return {
+        status: "MATCHED",
+        size: "10",
+        remainingSize: "0",
+        avgPrice: "0.59",
+      };
+    },
+  });
+  const exec = new Executor(poly, makeRisk());
+
+  const fill = await exec._waitForFill("ord-ws-timeout", 10, 5000);
+
+  assert.equal(fill.status, "MATCHED", "should discover fill via final REST check");
+  assert.equal(fill.avgPrice, 0.59);
+  assert.equal(getOrderCalls, 1, "should make exactly one REST getOrder call after WS TIMEOUT");
+});
+
+// ─── Test 37b: WS MATCHED missing qty reconciles via REST ─────────────────────
+test("_waitForFill: WS MATCHED without qty reconciles quantity via REST getOrder", async () => {
+  let getOrderCalls = 0;
+  const poly = makePoly({
+    userWsConnected: true,
+    waitForFillEvent: () => Promise.resolve({
+      status: "MATCHED",
+      avgPrice: 0.58,
+      filledQty: null,
+    }),
+    getOrder: async () => {
+      getOrderCalls++;
+      return {
+        status: "MATCHED",
+        size: "10",
+        remainingSize: "0",
+        avgPrice: "0.59",
+      };
+    },
+  });
+  const exec = new Executor(poly, makeRisk());
+
+  const fill = await exec._waitForFill("ord-ws-missing-qty", 10, 5000);
+
+  assert.equal(fill.status, "MATCHED");
+  assert.equal(fill.filledQty, 10, "should use reconciled REST quantity");
+  assert.equal(fill.avgPrice, 0.59, "REST avgPrice should override ambiguous WS payload");
+  assert.equal(fill.fillSource, "REST_RECONCILE");
+  assert.equal(fill.qtyConfidence, "reconciled");
+  assert.equal(getOrderCalls, 1, "should do one reconciliation getOrder call");
+});
+
+// ─── Test 37c: unresolved MATCHED qty fails closed in execute() ───────────────
+test("execute: UNKNOWN_MATCHED_QTY aborts entry and leaves risk state untouched", async () => {
+  const risk = makeRisk();
+  let cancelCalled = false;
+  const poly = makePoly({
+    placeOrder: async () => ({ id: "ord-unknown-qty", status: "OPEN" }),
+    cancelOrder: async () => { cancelCalled = true; return { success: true }; },
+  });
+  const exec = new Executor(poly, risk);
+  exec._monitorPosition = () => {};
+  exec._waitForFill = async () => ({
+    status: "UNKNOWN_MATCHED_QTY",
+    avgPrice: 0.58,
+    filledQty: 0,
+  });
+
+  const initialBankroll = risk.bankroll;
+  const trade = await exec.execute(makeSignal());
+
+  assert.equal(trade, null, "execute should fail closed on ambiguous matched quantity");
+  assert.equal(cancelCalled, true, "best-effort cancel should be attempted");
+  assert.equal(risk.openPositions.size, 0, "risk state must remain untouched");
+  assert.equal(exec.openOrders.size, 0, "no trade should be opened");
+  assert.equal(risk.bankroll, initialBankroll, "bankroll must not change");
+});
+
+// ─── Test 38: onBookUpdate triggers stop-loss exit ──────────────────────────
+test("onBookUpdate: triggers stop-loss when price drops below threshold", async () => {
+  const risk = makeRisk();
+  const poly = makePoly({
+    placeOrder: async () => ({ id: "ord-exit-book", status: "OPEN" }),
+  });
+  const exec = new Executor(poly, risk);
+  const trade = makeOpenTrade(exec, risk, {
+    id: "book-trade",
+    signal: makeSignal({ tokenId: "token-book-test" }),
+  });
+
+  // Mock _exitPosition to track calls
+  let exitCalled = false;
+  let exitReason = "";
+  exec._exitPosition = async (t, reason) => {
+    exitCalled = true;
+    exitReason = reason;
+    return true;
+  };
+
+  // Register trade in tokenToTrades (normally done by _monitorPosition)
+  exec._tokenToTrades.set("token-book-test", new Set(["book-trade"]));
+
+  // Simulate a book update with stop-loss price
+  // entryPrice=0.55, stopLoss=15% → trigger at pnlPct <= -0.15
+  // Need currentMid such that (mid - 0.55) * 10 / 5.50 <= -0.15
+  // (mid - 0.55) / 0.55 <= -0.15 → mid <= 0.55 * 0.85 = 0.4675
+  exec.onBookUpdate("token-book-test", {
+    mid: 0.40, bestBid: 0.39, bestAsk: 0.41,
+    bidDepth: 100, askDepth: 100,
+  });
+
+  // Allow async exit to process
+  await new Promise(r => setTimeout(r, 10));
+
+  assert.equal(exitCalled, true, "should trigger exit on stop-loss");
+  assert.equal(exitReason, "STOP_LOSS", "exit reason should be STOP_LOSS");
+});
+
+// ─── Test 39: onBookUpdate ignores CLOSING trades ───────────────────────────
+test("onBookUpdate: ignores trades with CLOSING status", () => {
+  const risk = makeRisk();
+  const exec = new Executor(makePoly(), risk);
+  const trade = makeOpenTrade(exec, risk, {
+    id: "closing-trade",
+    signal: makeSignal({ tokenId: "token-closing" }),
+  });
+  trade.status = "CLOSING";
+
+  exec._tokenToTrades.set("token-closing", new Set(["closing-trade"]));
+
+  let exitCalled = false;
+  exec._exitPosition = async () => { exitCalled = true; return true; };
+
+  exec.onBookUpdate("token-closing", { mid: 0.10, bestBid: 0.09, bestAsk: 0.11 });
+
+  assert.equal(exitCalled, false, "should not call exit for CLOSING trade");
+});
+
+// ─── Test 40: _checkExitConditions pure logic ───────────────────────────────
+test("_checkExitConditions: returns correct exit signals for profit target, stop loss, max hold, edge collapse", () => {
+  const exec = new Executor(makePoly(), makeRisk());
+
+  const baseTrade = () => ({
+    entryPrice: 0.55,
+    tokenQty: 10,
+    size: 5.50,
+    openTime: Date.now(),
+    direction: "BUY_YES",
+    signal: { modelProb: 0.65 },
+  });
+
+  // Profit target: pnlPct >= 0.08 (PROFIT_TARGET_PCT=0.08)
+  // (0.60 - 0.55) * 10 / 5.50 ≈ 0.0909 > 0.08
+  const profitTrade = baseTrade();
+  const profit = exec._checkExitConditions(profitTrade, 0.60);
+  assert.equal(profit.shouldExit, true);
+  assert.equal(profit.reason, "PROFIT_TARGET");
+
+  // Stop loss: pnlPct <= -0.15
+  // (0.46 - 0.55) * 10 / 5.50 ≈ -0.1636 < -0.15
+  const lossTrade = baseTrade();
+  const loss = exec._checkExitConditions(lossTrade, 0.46);
+  assert.equal(loss.shouldExit, true);
+  assert.equal(loss.reason, "STOP_LOSS");
+
+  // Edge collapse: |currentMid - targetPrice| < 0.02
+  // targetPrice for BUY_YES = modelProb = 0.65
+  const edgeTrade = baseTrade();
+  const edge = exec._checkExitConditions(edgeTrade, 0.64);
+  assert.equal(edge.shouldExit, true);
+  assert.equal(edge.reason, "EDGE_COLLAPSED");
+
+  // No exit: mid at 0.558 — tiny profit (0.014 < 0.03 target), no edge collapse
+  const holdTrade = baseTrade();
+  const hold = exec._checkExitConditions(holdTrade, 0.558);
+  assert.equal(hold.shouldExit, false);
+});
+
+// ─── Test 41: _cleanupMonitor removes trade from routing map ────────────────
+test("_cleanupMonitor: removes trade from _tokenToTrades and clears safety timer", () => {
+  const exec = new Executor(makePoly(), makeRisk());
+
+  const trade = {
+    id: "cleanup-trade",
+    signal: { tokenId: "token-cleanup" },
+  };
+
+  exec._tokenToTrades.set("token-cleanup", new Set(["cleanup-trade"]));
+  const intervalId = setInterval(() => {}, 100000);
+  exec._safetyTimers.set("cleanup-trade", intervalId);
+
+  exec._cleanupMonitor(trade);
+
+  assert.equal(exec._tokenToTrades.has("token-cleanup"), false, "tokenId entry should be removed");
+  assert.equal(exec._safetyTimers.has("cleanup-trade"), false, "safety timer should be cleared");
+
+  clearInterval(intervalId); // clean up just in case
+});
+
+// ─── Test 42: execute with maker strategy falls through to take after reprices ─
 test("execute: maker strategy falls through to take after MAX_REPRICES", async () => {
   const risk = makeRisk();
   let orderCount = 0;

@@ -56,9 +56,9 @@ function makeStrategy(overrides = {}) {
   s.tokenIdYes = "token-yes-abc";
   s.tokenIdNo  = "token-no-abc";
   s.spotPrice       = 80_000;
-  s.contractMid     = 0.73;
-  s.contractBestBid = 0.72;
-  s.contractBestAsk = 0.74;
+  s.contractMid     = 0.50;   // near-50¢: distFromMid=0, no distance penalty, threshold=0.08
+  s.contractBestBid = 0.49;
+  s.contractBestAsk = 0.51;
   s.contractBidDepth = 500;
   s.contractAskDepth = 500;
   s.lastSpotUpdate     = NOW;

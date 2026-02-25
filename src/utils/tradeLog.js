@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from "fs";
+import { appendFile, mkdirSync } from "fs";
 import { join } from "path";
 import { createLogger } from "./logger.js";
 
@@ -17,9 +17,7 @@ try { mkdirSync(DATA_DIR, { recursive: true }); } catch { /* ignore — dir alre
  * operator knows the audit trail may have gaps.
  */
 export function logTrade(record) {
-  try {
-    appendFileSync(LOG_PATH, JSON.stringify({ ...record, _at: new Date().toISOString() }) + "\n");
-  } catch (err) {
-    log.warn("Trade log write failed — audit record lost", { error: err.message, event: record.event, id: record.id });
-  }
+  appendFile(LOG_PATH, JSON.stringify({ ...record, _at: new Date().toISOString() }) + "\n", (err) => {
+    if (err) log.warn("Trade log write failed — audit record lost", { error: err.message, event: record.event, id: record.id });
+  });
 }

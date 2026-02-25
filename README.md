@@ -38,7 +38,7 @@ Exploits the 3-7 second lag between Binance spot price updates and Polymarket CL
 5. **Signal guards**: suppress startup window and pre-window signals; suppress when N(d2) > 90% (model saturation) or feedLag > 5s (stale REST data)
 6. **Risk check**: position limits, drawdown, cooldown, liquidity auto-scaling, fill probability gate
 7. **Execution**: maker order on wide spreads with time remaining; taker otherwise; reprices up to 2× before falling through
-8. **Monitoring**: track position, exit on edge collapse / timeout / stop loss / profit target
+8. **Monitoring**: event-driven exit checks on every book tick via `onBookUpdate()`; 500ms REST safety-poll when WS is stale; 5-minute hard timeout
 
 ## Setup
 
@@ -74,14 +74,15 @@ All configuration is in `.env`. Key parameters:
 | `MAX_BET_FRACTION` | 0.04 | Kelly fraction cap (4% of bankroll) |
 | `MAX_POSITION_USD` | 100 | Max USD per single trade |
 | `MAX_OPEN_POSITIONS` | 8 | Concurrent position limit |
-| `DAILY_LOSS_LIMIT` | 50 | Stop trading after this many USD lost in a day |
-| `PROFIT_TARGET_PCT` | 0.03 | Exit a position when it reaches 3% profit |
+| `DAILY_LOSS_LIMIT` | 200 | Stop trading when bankroll falls more than this below today's intraday high |
+| `PROFIT_TARGET_PCT` | 0.08 | Exit a position when it reaches 8% profit |
 | `STOP_LOSS_PCT` | 0.15 | Exit a position at 15% loss |
 | `COOLDOWN_MS` | 3000 | Minimum ms between trades (stamped atomically) |
 | `SLIPPAGE_BPS` | 15 | Expected slippage in basis points |
 | `FEE_BPS` | 20 | Polymarket fee in basis points |
 | `ORDER_TYPE` | GTC | Order type (GTC = Good Till Cancelled) |
 | `DRY_RUN` | true | Paper trading mode — no real orders placed |
+| `CALIBRATION_ENABLED` | false | Enable BS probability calibration from historical data (opt-in) |
 | `BTC_VOL` | 0.015 | BTC daily vol seed for Black-Scholes sigma (1.5%) |
 | `ETH_VOL` | 0.020 | ETH daily vol seed (2.0%) |
 | `SOL_VOL` | 0.030 | SOL daily vol seed (3.0%) |
@@ -91,7 +92,7 @@ All configuration is in `.env`. Key parameters:
 
 - **Kelly Criterion**: Half-Kelly sizing with configurable cap; uses live bankroll (not static startup value)
 - **Max Drawdown Kill Switch**: Auto-stops at 25% drawdown from peak; resets to current bankroll on each startup
-- **Daily Loss Limit**: Stops trading after `DAILY_LOSS_LIMIT` USD lost (resets at UTC midnight)
+- **Daily Loss Limit**: Stops trading when bankroll falls more than `DAILY_LOSS_LIMIT` USD below the intraday high watermark. Resets at UTC midnight; locks in intraday profits so you can never give back more than the limit from the day's peak.
 - **Position Limits**: Max concurrent positions and per-trade USD cap; per-market stacking prevented
 - **Cooldown**: Minimum ms between trades, stamped atomically in `canTrade()` to prevent races
 - **Liquidity Auto-Scaling**: Scales position size to 75% of available book depth rather than hard-blocking; blocks only when scaled size falls below $5 floor
@@ -107,9 +108,15 @@ All configuration is in `.env`. Key parameters:
 
 The engine continuously logs every evaluation to `data/features.ndjson` (outcome, edge, microstructure, vol) and every trade to `data/trades.ndjson`. These are used for:
 
-- **Calibration** (`src/engine/calibration.js`): Once 200+ fired signals accumulate, a binned correction table adjusts raw BS N(d2) probabilities toward observed win rates. Blend weight ramps conservatively (max 50%).
+- **Calibration** (`src/engine/calibration.js`): An optional binned correction table that adjusts raw BS N(d2) probabilities toward observed win rates. Enabled via `CALIBRATION_ENABLED=true` (default `false`). Requires 200+ fired signals to activate; blend weight ramps conservatively (max 50%). The current implementation uses a single global table — it does not yet segment by asset, vol regime, momentum, or liquidity. Enable only after verifying it improves reliability on your collected data.
 - **Adverse selection analysis**: P&L checkpoints at 5s/15s/30s after entry detect whether the arb is real or whether we're being picked off by informed flow.
-- **Offline analysis**: `scripts/analyze-calibration.js` prints reliability diagrams and Brier scores.
+- **Offline analysis scripts** (all read from `data/`):
+  - `scripts/analyze-calibration.js` — reliability diagrams, Brier scores
+  - `scripts/win-rate-breakdown.js` — win rate by market, direction, edge, feed lag, vol, hour; top 10 winners/losers; Kelly accuracy
+  - `scripts/stop-loss-autopsy.js` — stop-loss breakdown by market, entry quality, hold speed, adverse selection, vol regime, edge bucket
+  - `scripts/adverse-selection.js` — price trajectory at 5s/15s/30s checkpoints, directional accuracy, feed-lag correlation, immediate vs delayed losses
+  - `scripts/threshold-optimizer.js` — threshold sweep 3%–20%, per-asset/window optimal threshold, suppression cost analysis
+  - `scripts/market-hours.js` — win rate by UTC hour, signal quality by hour, per-asset heat map, session windows, day-of-week
 
 ## Multi-Market Support
 
@@ -154,7 +161,8 @@ tests/
 ├── featureLog.test.js       # Feature logging outcome and throttle tests
 ├── feeds.test.js            # Binance/Polymarket feed parsing tests
 ├── math.test.js             # Math utility tests (impliedProbability, Kelly, etc.)
-└── chainlink.test.js        # Chainlink strike fetch tests
+├── chainlink.test.js        # Chainlink strike fetch tests
+└── config.test.js           # Config validation tests
 
 data/                        # Runtime data (gitignored)
 ├── trades.ndjson            # Trade audit log
@@ -171,7 +179,7 @@ data/                        # Runtime data (gitignored)
 npm test
 ```
 
-Uses Node.js built-in `node:test` — no external framework required. 84 tests across 6 test files covering: partial fill handling, fill timeout, partial-exit risk accounting, cumulative P&L, shutdown mark-to-market, monitor race conditions, idempotent finalization, `canTrade` kill conditions, liquidity auto-scaling, fill probability gating, cooldown reservation, per-market order isolation, dynamic thresholds, feature log outcomes/throttle, feed parsing, math utilities, and Chainlink strike fetch.
+Uses Node.js built-in `node:test` — no external framework required. 107 tests across 7 test files covering: partial fill handling, fill timeout, partial-exit risk accounting, cumulative P&L, shutdown mark-to-market, monitor race conditions, idempotent finalization, `canTrade` kill conditions, liquidity auto-scaling, fill probability gating, cooldown reservation, per-market order isolation, dynamic thresholds, feature log outcomes/throttle, feed parsing, math utilities, Chainlink strike fetch, and config validation.
 
 ## Realistic Expectations
 

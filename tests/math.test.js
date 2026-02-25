@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 // math.js has no config imports — no env setup needed.
-const { impliedProbability, kellyFraction, calculateEdge } = await import("../src/utils/math.js");
+const { impliedProbability, kellyFraction, calculateEdge, polymarketFee } = await import("../src/utils/math.js");
 
 // ─── impliedProbability guard conditions ─────────────────────────────────────
 
@@ -138,4 +138,40 @@ test("calculateEdge: direction is BUY_NO when modelProb < contractPrice", () => 
   const e = calculateEdge(0.35, 0.50);
   assert.equal(e.direction, "BUY_NO");
   assert.ok(Math.abs(e.absolute - 0.15) < 0.001);
+});
+
+// ─── polymarketFee ────────────────────────────────────────────────────────────
+
+test("polymarketFee: peaks at 1.5625% at p=0.5", () => {
+  const fee = polymarketFee(0.5);
+  assert.ok(Math.abs(fee - 0.015625) < 1e-8,
+    `expected 0.015625, got ${fee}`);
+});
+
+test("polymarketFee: is symmetric — fee(p) === fee(1-p)", () => {
+  assert.ok(Math.abs(polymarketFee(0.3) - polymarketFee(0.7)) < 1e-10);
+  assert.ok(Math.abs(polymarketFee(0.2) - polymarketFee(0.8)) < 1e-10);
+});
+
+test("polymarketFee: decreases monotonically from 0.5 toward extremes", () => {
+  assert.ok(polymarketFee(0.5) > polymarketFee(0.3));
+  assert.ok(polymarketFee(0.3) > polymarketFee(0.1));
+  assert.ok(polymarketFee(0.1) > 0);
+});
+
+test("polymarketFee: clamps gracefully at price=0 and price=1", () => {
+  assert.ok(Number.isFinite(polymarketFee(0)));
+  assert.ok(Number.isFinite(polymarketFee(1)));
+  // Both clamped to p=0.01 / p=0.99 — fee is tiny but nonzero
+  assert.ok(polymarketFee(0) > 0);
+  assert.ok(polymarketFee(1) > 0);
+});
+
+test("polymarketFee: known values at common entry prices", () => {
+  // p=0.3: 0.25 × (0.3×0.7)^2 = 0.25 × 0.0441 = 0.011025 → ~1.10%
+  assert.ok(Math.abs(polymarketFee(0.3) - 0.011025) < 1e-8,
+    `p=0.3 fee expected ~0.011025, got ${polymarketFee(0.3)}`);
+  // p=0.2: 0.25 × (0.2×0.8)^2 = 0.25 × 0.0256 = 0.0064 → ~0.64%
+  assert.ok(Math.abs(polymarketFee(0.2) - 0.0064) < 1e-8,
+    `p=0.2 fee expected ~0.0064, got ${polymarketFee(0.2)}`);
 });

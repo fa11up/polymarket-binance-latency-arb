@@ -9,7 +9,8 @@ const log = createLogger("EXECUTOR");
 // ─── TIMING CONSTANTS ──────────────────────────────────────────────────────────
 const FILL_TIMEOUT_MS     = 5_000;   // max time to wait for fill confirmation
 const FILL_POLL_MS        = 250;     // GET /order polling interval during fill wait
-const MONITOR_INTERVAL_MS = 2_000;   // position P&L check frequency
+const MONITOR_INTERVAL_MS = 2_000;   // position P&L check frequency (legacy, used for maker reprice)
+const SAFETY_POLL_MS      = 500;     // safety-net REST polling when WS book events are stale
 const MAX_HOLD_MS         = 300_000; // 5 minutes — hard maximum for any position
 const SAFETY_BUFFER_MS    = 5_000;   // extra window after maxHold before force-exit
 const MAX_TRADE_HISTORY   = 500;     // rolling window of closed trades kept in memory
@@ -151,10 +152,15 @@ export class Executor {
     this.maxHistory = MAX_TRADE_HISTORY;
 
     this.onTradeEvent = null;
+
+    // ─── Event-driven monitoring state ────────────────────────────────
+    this._tokenToTrades = new Map();   // tokenId → Set<tradeId>
+    this._safetyTimers = new Map();    // tradeId → intervalId
   }
 
   // ─── CLOSE BOOKKEEPING ─────────────────────────────────────────────
   _finalizeClose(trade, { reason, exitPrice, pnl, estimated = false }) {
+    this._cleanupMonitor(trade);
     const totalPnl = (trade.realizedPnl ?? 0) + pnl;
     trade.status = "CLOSED";
     trade.pnl = totalPnl;
@@ -206,7 +212,7 @@ export class Executor {
    * Poll until the order reaches a terminal state or timeout.
    *
    * Returns a normalized fill result:
-   *   { status: "MATCHED"|"PARTIAL"|"CANCELLED"|"TIMEOUT", avgPrice, filledQty }
+   *   { status: "MATCHED"|"PARTIAL"|"CANCELLED"|"TIMEOUT"|"UNKNOWN_MATCHED_QTY", avgPrice, filledQty }
    *
    * status meanings:
    *   MATCHED   — fully filled; avgPrice and filledQty are reliable
@@ -214,6 +220,8 @@ export class Executor {
    *               filledQty is the filled portion, avgPrice may be null
    *   CANCELLED — exchange cancelled with no fills
    *   TIMEOUT   — polling expired, fill state unknown; filledQty best-effort
+   *   UNKNOWN_MATCHED_QTY — WS reported MATCHED but filled quantity could not
+   *                         be reliably determined from WS or REST reconciliation
    *
    * Dry-run orders (id starts with "dry-") are immediately MATCHED.
    */
@@ -222,6 +230,105 @@ export class Executor {
       return { status: "MATCHED", avgPrice: null, filledQty: requestedQty };
     }
 
+    // ── Try WS event path first ────────────────────────────────────────
+    const wsResult = this.poly.waitForFillEvent?.(orderId, timeoutMs) ?? null;
+    if (wsResult !== null) {
+      const result = await wsResult;
+
+      if (result.status === "MATCHED") {
+        // Use WS qty only when explicitly present and positive.
+        const wsFilledQty = clampFilledQty(result.filledQty, requestedQty);
+        if (wsFilledQty > 0) {
+          return {
+            status: "MATCHED",
+            avgPrice: parsePrice(result.avgPrice),
+            filledQty: wsFilledQty,
+            fillSource: "WS",
+            qtyConfidence: "high",
+          };
+        }
+
+        // WS says MATCHED but omitted/invalid size — reconcile once via REST.
+        try {
+          const order = await this.poly.getOrder(orderId);
+          const status = normalizeStatus(order.status);
+
+          if (status === "MATCHED" || status === "FILLED") {
+            const filledQty = clampFilledQty(parseFilledQty(order), requestedQty);
+            if (filledQty > 0) {
+              return {
+                status: "MATCHED",
+                avgPrice: parsePrice(order.avgPrice ?? order.fillPrice ?? result.avgPrice),
+                filledQty,
+                fillSource: "REST_RECONCILE",
+                qtyConfidence: "reconciled",
+              };
+            }
+            return {
+              status: "UNKNOWN_MATCHED_QTY",
+              avgPrice: parsePrice(order.avgPrice ?? order.fillPrice ?? result.avgPrice),
+              filledQty: 0,
+              fillSource: "REST_RECONCILE",
+              qtyConfidence: "unknown",
+            };
+          }
+
+          if (status === "CANCELLED") {
+            const filledQty = clampFilledQty(parseFilledQty(order), requestedQty);
+            return {
+              status: filledQty > 0 ? "PARTIAL" : "CANCELLED",
+              avgPrice: parsePrice(order.avgPrice ?? order.fillPrice ?? result.avgPrice),
+              filledQty,
+              fillSource: "REST_RECONCILE",
+              qtyConfidence: filledQty > 0 ? "reconciled" : "high",
+            };
+          }
+        } catch { /* fall through to unknown */ }
+
+        return {
+          status: "UNKNOWN_MATCHED_QTY",
+          avgPrice: parsePrice(result.avgPrice),
+          filledQty: 0,
+          fillSource: "WS",
+          qtyConfidence: "unknown",
+        };
+      }
+
+      if (result.status === "CANCELLED") {
+        const filledQty = clampFilledQty(result.filledQty, requestedQty);
+        return {
+          status: filledQty > 0 ? "PARTIAL" : "CANCELLED",
+          avgPrice: parsePrice(result.avgPrice),
+          filledQty,
+        };
+      }
+
+      // WS TIMEOUT — do one final REST check before giving up
+      try {
+        const order = await this.poly.getOrder(orderId);
+        const status = normalizeStatus(order.status);
+        if (status === "MATCHED" || status === "FILLED") {
+          const filledQty = clampFilledQty(parseFilledQty(order) || requestedQty, requestedQty);
+          return {
+            status: "MATCHED",
+            avgPrice: parsePrice(order.avgPrice ?? order.fillPrice),
+            filledQty,
+          };
+        }
+        const filledQty = clampFilledQty(parseFilledQty(order), requestedQty);
+        if (filledQty > 0) {
+          return {
+            status: "PARTIAL",
+            avgPrice: parsePrice(order.avgPrice ?? order.fillPrice),
+            filledQty,
+          };
+        }
+      } catch { /* can't determine — treat as zero */ }
+
+      return { status: "TIMEOUT", avgPrice: null, filledQty: 0 };
+    }
+
+    // ── REST polling fallback (WS disconnected) ────────────────────────
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
@@ -276,12 +383,6 @@ export class Executor {
    */
   _selectOrderStrategy(signal) {
     const secsToExpiry = signal.hoursToExpiry * 3600;
-    const spread = signal.direction === "BUY_YES"
-      ? (signal.entryPrice - (signal.contractPrice - (signal.entryPrice - signal.contractPrice)))
-      : 0;
-    // Compute spread from signal context
-    const bestBid = signal.contractPrice - (signal.entryPrice - signal.contractPrice);
-    const bestAsk = signal.direction === "BUY_YES" ? signal.entryPrice : undefined;
     const actualSpread = signal._spread ?? Math.abs(signal.entryPrice - signal.contractPrice) * 2;
 
     if (actualSpread >= 0.03 && secsToExpiry > 120) {
@@ -297,6 +398,105 @@ export class Executor {
     }
 
     return { type: "take", price: signal.entryPrice };
+  }
+
+  // ─── EXIT CONDITION LOGIC (extracted for reuse) ───────────────────────
+  /**
+   * Pure logic: evaluate whether a trade should exit based on current mid price.
+   * Updates trade.currentMid and trade.unrealizedPnl. Records adverse selection.
+   * Returns { shouldExit, reason }.
+   */
+  _checkExitConditions(trade, currentMid) {
+    const profitTarget = CONFIG.risk.profitTargetPct;
+    const stopLoss = -CONFIG.risk.stopLossPct;
+    const age = Date.now() - trade.openTime;
+
+    const unrealizedPnl = (currentMid - trade.entryPrice) * trade.tokenQty;
+    const pnlPct = unrealizedPnl / trade.size;
+
+    trade.currentMid = currentMid;
+    trade.unrealizedPnl = unrealizedPnl;
+
+    this._recordAdverseSelection(trade, currentMid, unrealizedPnl);
+
+    let shouldExit = false;
+    let reason = "";
+
+    if (age >= MAX_HOLD_MS)       { shouldExit = true; reason = "MAX_HOLD_TIME"; }
+    if (pnlPct >= profitTarget)   { shouldExit = true; reason = "PROFIT_TARGET"; }
+    if (pnlPct <= stopLoss)       { shouldExit = true; reason = "STOP_LOSS"; }
+
+    const targetPrice = trade.direction === "BUY_YES" ? trade.signal.modelProb : 1 - trade.signal.modelProb;
+    if (Math.abs(currentMid - targetPrice) < 0.02) { shouldExit = true; reason = "EDGE_COLLAPSED"; }
+
+    return { shouldExit, reason };
+  }
+
+  /**
+   * Record adverse selection checkpoints at 5s, 15s, 30s after open.
+   */
+  _recordAdverseSelection(trade, currentMid, unrealizedPnl) {
+    if (!trade._adverseSelection) trade._adverseSelection = [];
+    const ageSec = (Date.now() - trade.openTime) / 1000;
+    for (const cp of [5, 15, 30]) {
+      if (ageSec >= cp && !trade._adverseSelection.some(s => s.checkpoint === cp)) {
+        trade._adverseSelection.push({
+          checkpoint: cp,
+          currentMid,
+          midMove: currentMid - trade.entryPrice,
+          pnlPct: unrealizedPnl / trade.size,
+        });
+      }
+    }
+  }
+
+  // ─── BOOK EVENT HANDLER (event-driven monitoring) ──────────────────
+  /**
+   * Called by ArbEngine when a Polymarket book event arrives for a token
+   * that has open positions. Evaluates exit conditions immediately.
+   */
+  onBookUpdate(tokenId, book) {
+    const tradeIds = this._tokenToTrades.get(tokenId);
+    if (!tradeIds || tradeIds.size === 0) return;
+
+    const currentMid = book.mid;
+    if (currentMid == null || (book.bestBid === 0 && book.bestAsk === 1)) return;
+
+    for (const tradeId of tradeIds) {
+      const trade = this.openOrders.get(tradeId);
+      if (!trade) continue;
+      if (trade.status === "CLOSING" || trade.status === "CLOSED") continue;
+
+      trade._lastBookEventMs = Date.now();
+
+      const { shouldExit, reason } = this._checkExitConditions(trade, currentMid);
+      if (shouldExit) {
+        this._exitPosition(trade, reason, currentMid).catch(err => {
+          log.error(`onBookUpdate exit failed for ${tradeId}`, { error: err.message });
+        });
+      }
+    }
+  }
+
+  /**
+   * Remove trade from event-driven monitoring maps and clear safety timer.
+   */
+  _cleanupMonitor(trade) {
+    // Remove from _tokenToTrades
+    const tokenId = trade.signal?.tokenId;
+    if (tokenId) {
+      const tradeIds = this._tokenToTrades.get(tokenId);
+      if (tradeIds) {
+        tradeIds.delete(trade.id);
+        if (tradeIds.size === 0) this._tokenToTrades.delete(tokenId);
+      }
+    }
+    // Clear safety timer
+    const safetyId = this._safetyTimers.get(trade.id);
+    if (safetyId) {
+      clearInterval(safetyId);
+      this._safetyTimers.delete(trade.id);
+    }
   }
 
   // ─── EXECUTE SIGNAL ─────────────────────────────────────────────────
@@ -394,6 +594,15 @@ export class Executor {
           actualTokenQty   = fill.filledQty;
           this.fillRateStats.filled++;
 
+        } else if (fill.status === "UNKNOWN_MATCHED_QTY") {
+          try { await this.poly.cancelOrder(order.id); } catch { /* best effort */ }
+          this.fillRateStats.failed++;
+          log.error(`[${signal.label}] MATCHED fill with unknown quantity — aborting to avoid exposure drift`, {
+            orderId: order.id,
+          });
+          sendAlert(`⚠️ ${signal.label}: matched fill with unknown quantity for ${order.id} — entry aborted`, "error");
+          return null;
+
         } else if (fill.status === "PARTIAL" && fill.filledQty > 0) {
           // Cancel the unfilled remainder, then open a position for what filled.
           try { await this.poly.cancelOrder(order.id); } catch { /* best effort */ }
@@ -464,6 +673,7 @@ export class Executor {
         size: actualDollarSize,
         edge: signal.edge,
         modelProb: signal.modelProb,
+        vol: signal.vol ?? null,
         spotPrice: signal.spotPrice,
         strikePrice: signal.strikePrice,
         openTime: trade.openTime,
@@ -486,67 +696,58 @@ export class Executor {
   }
 
   // ─── POSITION MONITORING ────────────────────────────────────────────
+  /**
+   * Event-driven monitoring with safety-poll fallback.
+   *
+   * Primary path: book events arrive via `onBookUpdate()` (called from ArbEngine).
+   * Safety path: 500ms REST poll kicks in when WS book events are stale (>400ms).
+   * Force-exit: 305s hard timeout unchanged.
+   */
   _monitorPosition(trade) {
-    const checkInterval = MONITOR_INTERVAL_MS;
-    const maxHoldMs = MAX_HOLD_MS;
-    const profitTarget = CONFIG.risk.profitTargetPct;
-    const stopLoss = -CONFIG.risk.stopLossPct;
+    // Register trade for book event routing
+    const tokenId = trade.signal.tokenId;
+    if (!this._tokenToTrades.has(tokenId)) {
+      this._tokenToTrades.set(tokenId, new Set());
+    }
+    this._tokenToTrades.get(tokenId).add(trade.id);
+    trade._lastBookEventMs = Date.now();
 
-    const monitor = setInterval(async () => {
-      if (!this.openOrders.has(trade.id)) { clearInterval(monitor); return; }
+    // Safety poll: REST fallback when WS book events are stale
+    const safetyInterval = setInterval(async () => {
+      if (!this.openOrders.has(trade.id)) { clearInterval(safetyInterval); this._safetyTimers.delete(trade.id); return; }
       if (trade.status === "CLOSING") return;
 
-      const age = Date.now() - trade.openTime;
+      const timeSinceBook = Date.now() - (trade._lastBookEventMs ?? 0);
 
       let currentMid;
-      try {
-        const currentBook = await this.poly.fetchOrderbook(trade.signal.tokenId);
-        if (!currentBook || currentBook.bestBid === 0 && currentBook.bestAsk === 1) return;
-        currentMid = currentBook.mid;
-      } catch {
-        return;
-      }
-
-      // P&L using actual token quantity held
-      const unrealizedPnl = (currentMid - trade.entryPrice) * trade.tokenQty;
-      const pnlPct = unrealizedPnl / trade.size;
-
-      trade.currentMid = currentMid;
-      trade.unrealizedPnl = unrealizedPnl;
-
-      // Adverse selection checkpoints: snapshot P&L at 5s, 15s, 30s after open
-      if (!trade._adverseSelection) trade._adverseSelection = [];
-      const ageSec = (Date.now() - trade.openTime) / 1000;
-      for (const cp of [5, 15, 30]) {
-        if (ageSec >= cp && !trade._adverseSelection.some(s => s.checkpoint === cp)) {
-          trade._adverseSelection.push({
-            checkpoint: cp,
-            currentMid,
-            midMove: currentMid - trade.entryPrice,
-            pnlPct: unrealizedPnl / trade.size,
-          });
+      if (timeSinceBook > 400) {
+        // WS data is stale — fetch via REST
+        try {
+          const currentBook = await this.poly.fetchOrderbook(trade.signal.tokenId);
+          if (!currentBook || (currentBook.bestBid === 0 && currentBook.bestAsk === 1)) return;
+          currentMid = currentBook.mid;
+        } catch {
+          return;
         }
+      } else {
+        // WS data is fresh — use cached mid for exit check
+        currentMid = trade.currentMid;
+        if (currentMid == null) return;
       }
 
-      let shouldExit = false;
-      let exitReason = "";
-
-      if (age >= maxHoldMs)     { shouldExit = true; exitReason = "MAX_HOLD_TIME"; }
-      if (pnlPct >= profitTarget) { shouldExit = true; exitReason = "PROFIT_TARGET"; }
-      if (pnlPct <= stopLoss)   { shouldExit = true; exitReason = "STOP_LOSS"; }
-
-      const targetPrice = trade.direction === "BUY_YES" ? trade.signal.modelProb : 1 - trade.signal.modelProb;
-      if (Math.abs(currentMid - targetPrice) < 0.02) { shouldExit = true; exitReason = "EDGE_COLLAPSED"; }
-
+      const { shouldExit, reason } = this._checkExitConditions(trade, currentMid);
       if (shouldExit) {
-        const exited = await this._exitPosition(trade, exitReason, currentMid);
-        if (exited) clearInterval(monitor);
+        const exited = await this._exitPosition(trade, reason, currentMid);
+        if (exited) { clearInterval(safetyInterval); this._safetyTimers.delete(trade.id); }
       }
-    }, checkInterval);
+    }, SAFETY_POLL_MS);
+
+    this._safetyTimers.set(trade.id, safetyInterval);
 
     // Safety: force exit after max hold regardless of prior exit attempts.
     setTimeout(async () => {
-      clearInterval(monitor);
+      clearInterval(safetyInterval);
+      this._safetyTimers.delete(trade.id);
       if (!this.openOrders.has(trade.id)) return;
       let currentMid = trade.currentMid ?? trade.entryPrice;
       try {
@@ -556,8 +757,6 @@ export class Executor {
 
       const exited = await this._exitPosition(trade, "FORCE_EXIT", currentMid);
       if (!exited && this.openOrders.has(trade.id) && trade.status !== "CLOSING") {
-        // Sell order still unconfirmed. Close risk state at mark to prevent
-        // permanent drift — but alert that the exchange position may still be open.
         const pnl = (currentMid - trade.entryPrice) * trade.tokenQty;
         log.error(`FORCE_EXIT unconfirmed for ${trade.id} — closing risk at mark; verify on exchange`, { pnl: pnl.toFixed(2) });
         sendAlert(`⚠️ Exit unconfirmed for ${trade.id} — closed risk at mark, verify on exchange`, "error");
@@ -568,7 +767,7 @@ export class Executor {
           estimated: true,
         });
       }
-    }, maxHoldMs + SAFETY_BUFFER_MS);
+    }, MAX_HOLD_MS + SAFETY_BUFFER_MS);
   }
 
   /**
